@@ -50,7 +50,7 @@ need_tools jq
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 files="$work/files"
-flatten_artifacts "$artifacts" "$files"
+flatten_artifacts copy "$artifacts" "$files"
 
 # The names that later steps add. The build must not make them.
 names="$(list_dir "$files")"

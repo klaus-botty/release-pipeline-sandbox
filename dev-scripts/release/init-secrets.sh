@@ -10,8 +10,7 @@
 #
 # Usage: init-secrets.sh [--repo OWNER/NAME]
 #
-# Environment: RELEASE_SIGNING_KEY, RELEASE_SECRETS_FILE, RELEASE_TAURI_CLI
-# (see sign-release.sh).
+# Environment: RELEASE_SIGNING_KEY, RELEASE_SECRETS_FILE (see sign-release.sh).
 
 set -euo pipefail
 
@@ -52,7 +51,6 @@ if [ -e "$secrets_file" ] || [ -L "$secrets_file" ]; then
 	die "$secrets_file exists already. Move it away first, if you want to make a new one."
 fi
 
-find_tauri_cli
 select_signing_key
 log "signing key: $SIGNING_KEY"
 
@@ -75,17 +73,18 @@ else
 	IFS= read -r tauri_key_password || true
 fi
 
-# Check the key before it is saved: sign a test file, and verify the signature
-# with the updater public key of the app.
+# Check the key before it is saved: sign a test file with the same function
+# that the signing script uses, and verify the signature with the updater
+# public key of the app. The self-test uses a fixed version.
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 printf 'updater key self-test\n' >"$work/selftest"
 write_updater_pubkey "$work/updater.pub"
-TAURI_SIGNING_PRIVATE_KEY="$tauri_key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$tauri_key_password" \
-	"${TAURI_CLI[@]}" signer sign "$work/selftest" >/dev/null </dev/null ||
-	die "the Tauri CLI cannot sign with this key and password"
-verify_updater_sig "$work/updater.pub" "$work/selftest.sig" "$work/selftest" ||
+updater_sign "$tauri_key" "$tauri_key_password" "$work/selftest" 0.0.0 ||
+	die "minisign cannot sign with this key and password"
+selftest_comment="$(updater_sig_comment "$work/updater.pub" "$work/selftest.sig" "$work/selftest")" ||
 	die "this is not the updater key of the app: its signature does not match the updater public key"
+check_updater_comment selftest.sig "$selftest_comment" selftest 0.0.0
 
 # Write the file. umask 077 keeps the file and new directories private.
 # noclobber makes the shell refuse to replace a file that appeared meanwhile.

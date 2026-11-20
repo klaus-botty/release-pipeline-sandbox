@@ -100,7 +100,8 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 # check_draft: the checks that stage and publish share. Sets release, release_id,
-# and commit.
+# and commit. With updater targets, it also sets RELEASE_VERSION and makes sure
+# that the app configuration at the release commit has this version.
 check_draft() {
 	local branch
 	branch="${CFG_RELEASE_BRANCH:-}"
@@ -124,6 +125,10 @@ check_draft() {
 	require_build_run "$repo" "$run_id" "$commit"
 	require_commit_on_branch "$repo" "$commit" "$branch"
 	require_tag_matches "$repo" "$tag" "$commit"
+	if uses_updater; then
+		set_release_version "$tag"
+		require_app_version "$repo" "$commit" "$RELEASE_VERSION"
+	fi
 }
 
 # in_list NAME LIST: true if the newline-separated LIST holds NAME.
@@ -132,12 +137,13 @@ in_list() {
 }
 
 stage() {
-	local staging="$work/staging" built="$work/built" manifest name present expected hash
+	local staging="$work/staging" built="$work/built" manifest name present expected hash rerun
 	local upload=()
 	load_config
 	load_allowed_signers
 	check_draft
 
+	rerun="The signing script has to run again."
 	[ "$(printf '%s' "$release" | jq -r '.assets | length')" != 0 ] ||
 		die "the draft release $tag has no files. The signing script has to run first."
 	step "Downloading the draft release"
@@ -146,7 +152,7 @@ stage() {
 	step "Checking the signed manifest"
 	make_verify_keyring "$work/keyring"
 	manifest="$staging/$MANIFEST_NAME"
-	[ -f "$manifest" ] || die "the draft release has no $MANIFEST_NAME. The signing script has to run first."
+	[ -f "$manifest" ] || die "the draft release has no $MANIFEST_NAME. $rerun"
 	verify_detached "$staging/$MANIFEST_SIG_NAME" "$manifest" ||
 		die "$MANIFEST_NAME has no good signature from an allowed signer"
 	check_manifest "$manifest"
@@ -158,15 +164,20 @@ stage() {
 		"" | "$MANIFEST_NAME" | "$MANIFEST_SIG_NAME") continue ;;
 		esac
 		in_list "$name" "$expected" || die "extra file on the draft release: $name"
+		# Refuse a changed file before the large download of the build output.
+		[ "$(sha256_of "$staging/$name")" = "$(manifest_hash "$manifest" "$name")" ] ||
+			die "hash mismatch for $name on the draft release: the file does not match $MANIFEST_NAME. $rerun"
 	done <<<"$present"
 
 	step "Adding the unchanged build files of run $run_id"
 	download_build_artifacts "$repo" "$run_id" "$built"
+	check_build_info "$built/$BUILD_INFO_NAME" "$repo" "$tag" "$commit" "$run_id" \
+		"The build output of run $run_id does not belong to release $tag."
 	while IFS= read -r name; do
 		[ -n "$name" ] || continue
 		[ ! -e "$staging/$name" ] || continue
-		[ -f "$built/$name" ] || die "$name is in $MANIFEST_NAME, but neither on the draft release nor in the build run"
-		cp "$built/$name" "$staging/$name"
+		[ -f "$built/$name" ] || die "$name is in $MANIFEST_NAME, but neither on the draft release nor in the build run. $rerun"
+		mv "$built/$name" "$staging/$name"
 		upload+=("$staging/$name")
 	done <<<"$expected"
 
@@ -227,7 +238,7 @@ publish() {
 
 	step "Verifying the draft release again"
 	download_release_assets "$repo" "$release" "$download"
-	[ -f "$download/$MANIFEST_NAME" ] || die "the draft release has no $MANIFEST_NAME"
+	[ -f "$download/$MANIFEST_NAME" ] || die "the draft release has no $MANIFEST_NAME. The signing script has to run again."
 	hash="$(sha256_of "$download/$MANIFEST_NAME")"
 	[ "$hash" = "$manifest_sha256" ] ||
 		die "$MANIFEST_NAME changed after the stage step: sha256 is $hash, expected $manifest_sha256"

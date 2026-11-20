@@ -66,6 +66,12 @@ updater_target_count() {
 	jq -r '(.updater.targets // []) | length' "$RELEASE_CONFIG"
 }
 
+# uses_updater: true if the configuration has updater targets. Without them,
+# the scripts make no updater signatures and skip all version logic.
+uses_updater() {
+	[ "$(updater_target_count)" != 0 ]
+}
+
 # updater_target_pattern INDEX / updater_target_platforms INDEX
 updater_target_pattern() {
 	jq -er --argjson i "$1" '.updater.targets[$i].pattern' "$RELEASE_CONFIG"
@@ -98,6 +104,125 @@ write_updater_pubkey() {
 	[ -f "$file" ] || die "updater public key file not found: $file"
 	value="$(jq -er "$filter" "$file")" || die "no updater public key at $filter in $file"
 	printf '%s' "$value" | base64 --decode >"$1" || die "the updater public key in $file is not valid base64"
+}
+
+# ---------------------------------------------------------------------------
+# Release version
+# ---------------------------------------------------------------------------
+
+# Semantic version 2.0.0, without a leading "v".
+SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+
+# set_release_version TAG: sets RELEASE_VERSION to the version of the release:
+# TAG without one leading "v". Fails unless the rest is a semantic version.
+# The updater signatures, latest.json, and every check use this one value.
+set_release_version() {
+	local version="${1#v}"
+	[[ "$version" =~ $SEMVER_RE ]] ||
+		die "tag $1 does not name a release version: '$version' is not a semantic version (expected v1.2.3 or 1.2.3)"
+	RELEASE_VERSION="$version"
+}
+
+# require_app_version REPO COMMIT VERSION: fails unless the app configuration
+# of the release commit holds VERSION. The script reads the file at COMMIT
+# through the GitHub API, not from the local checkout.
+require_app_version() {
+	local repo="$1" commit="$2" version="$3" path filter content app_version
+	path="$(cfg .updater.version_file)"
+	filter="$(cfg .updater.version_jq)"
+	content="$(gh api -H "Accept: application/vnd.github.raw+json" "repos/$repo/contents/$path?ref=$commit")" ||
+		die "cannot read $path at commit $commit from $repo"
+	app_version="$(printf '%s' "$content" | jq -er "$filter")" ||
+		die "$path at commit $commit has no app version at $filter"
+	[ "$app_version" = "$version" ] ||
+		die "the app version in $path at commit $commit is $app_version, but the release version is $version. Set the version in the app and tag that commit."
+}
+
+# ---------------------------------------------------------------------------
+# Updater signatures
+#
+# A Tauri updater key, public key, and .sig file are standard minisign files,
+# encoded with base64 one more time. The trusted comment is the one that the
+# Tauri CLI writes with --app-version:
+#   timestamp:<unix seconds><TAB>file:<file name><TAB>version:<version>
+# ---------------------------------------------------------------------------
+
+UPDATER_UNTRUSTED_COMMENT="signature from tauri secret key"
+
+# updater_sign KEY PASSWORD FILE VERSION: writes FILE.sig. KEY is the
+# base64-encoded updater private key. The key reaches minisign through a pipe,
+# and the password through stdin, so neither reaches the disk or a command line.
+updater_sign() {
+	local key="$1" password="$2" file="$3" version="$4" name comment raw out rc=0
+	name="${file##*/}"
+	raw="$file.sig.minisig"
+	for out in "$file.sig" "$raw"; do
+		[ ! -e "$out" ] && [ ! -L "$out" ] || die "$out exists already"
+	done
+	comment="timestamp:$(date +%s)"$'\t'"file:$name"$'\t'"version:$version"
+	out="$(printf '%s\n' "$password" | minisign -S -s <(printf '%s' "$key" | base64 --decode) \
+		-m "$file" -x "$raw" -t "$comment" -c "$UPDATER_UNTRUSTED_COMMENT" 2>&1)" || rc=$?
+	if [ "$rc" != 0 ]; then
+		rm -f "$raw"
+		log "minisign cannot sign $name: $(printf '%s' "$out" | tr '\n' ' ')"
+		return 1
+	fi
+	base64 <"$raw" | tr -d '\n' >"$file.sig"
+	rm -f "$raw"
+}
+
+# updater_sig_comment PUBKEY_FILE SIG_FILE FILE: prints the trusted comment of
+# an updater signature. minisign prints it only after it verified the signature
+# of FILE and the global signature that covers the trusted comment. The comment
+# is never read from the file directly. Logs the cause and fails otherwise.
+updater_sig_comment() {
+	local pubkey="$1" sig="$2" file="$3" out rc=0
+	if ! base64 --decode <"$sig" >/dev/null 2>&1; then
+		log "${sig##*/} is not valid base64"
+		return 1
+	fi
+	out="$(minisign -V -Q -p "$pubkey" -x <(base64 --decode <"$sig") -m "$file" 2>&1)" || rc=$?
+	if [ "$rc" != 0 ]; then
+		# With -Q, minisign prints no cause. Ask again without -Q, for the message only.
+		out="$(minisign -V -p "$pubkey" -x <(base64 --decode <"$sig") -m "$file" 2>&1)" || true
+		log "${sig##*/}: minisign rejects it for ${file##*/} with the updater public key of the app: $(printf '%s' "$out" | tr '\n' ' ')"
+		return 1
+	fi
+	case "$out" in
+	*$'\n'*)
+		log "${sig##*/}: minisign printed more than one line: $(printf '%q' "$out")"
+		return 1
+		;;
+	esac
+	printf '%s\n' "$out"
+}
+
+# check_updater_comment SIG_NAME COMMENT FILE_NAME VERSION: fails unless the
+# verified trusted COMMENT has exactly the fields timestamp, file, and version,
+# in this order, for FILE_NAME and VERSION.
+check_updater_comment() {
+	local sig="$1" comment="$2" name="$3" version="$4"
+	local re=$'^timestamp:([0-9]+)\tfile:([^\t]*)\tversion:([^\t]*)$'
+	if ! [[ "$comment" =~ $re ]]; then
+		case "$comment" in
+		*$'\t'version:*) ;;
+		*) die "$sig: the trusted comment has no version field (was it signed without the app version?): $(printf '%q' "$comment")" ;;
+		esac
+		die "$sig: the trusted comment is not 'timestamp:<digits><TAB>file:<name><TAB>version:<version>': $(printf '%q' "$comment")"
+	fi
+	[ "${BASH_REMATCH[2]}" = "$name" ] ||
+		die "$sig: the trusted comment names the file $(printf '%q' "${BASH_REMATCH[2]}"), not $name"
+	[ "${BASH_REMATCH[3]}" = "$version" ] ||
+		die "$sig: the trusted comment names the version $(printf '%q' "${BASH_REMATCH[3]}"), but the release version is $version"
+}
+
+# verify_updater_sig PUBKEY_FILE SIG_FILE FILE VERSION: fails unless SIG_FILE
+# is a good updater signature of FILE for VERSION.
+verify_updater_sig() {
+	local pubkey="$1" sig="$2" file="$3" version="$4" comment
+	comment="$(updater_sig_comment "$pubkey" "$sig" "$file")" ||
+		die "the updater signature ${sig##*/} of ${file##*/} is not valid for the updater public key of the app"
+	check_updater_comment "${sig##*/}" "$comment" "${file##*/}" "$version"
 }
 
 # ---------------------------------------------------------------------------
@@ -208,10 +333,16 @@ $expected
 EOF
 }
 
-# flatten_artifacts SRC DST: copies the files of every artifact directory in SRC
-# into DST. SRC stays as it is. Fails on nested directories and on a name that occurs twice.
+# flatten_artifacts MODE SRC DST: puts the files of every artifact directory in
+# SRC into DST. MODE "copy" leaves SRC as it is. MODE "move" moves the files,
+# for a temp download that the caller owns. Fails on nested directories and on
+# a name that occurs twice.
 flatten_artifacts() {
-	local src="$1" dst="$2" artifact names name
+	local mode="$1" src="$2" dst="$3" artifact names name
+	case "$mode" in
+	copy | move) ;;
+	*) die "flatten_artifacts: unknown mode $mode" ;;
+	esac
 	mkdir -p "$dst"
 	for artifact in "$src"/*; do
 		[ -e "$artifact" ] || continue
@@ -220,7 +351,11 @@ flatten_artifacts() {
 		while IFS= read -r name; do
 			[ -n "$name" ] || continue
 			[ ! -e "$dst/$name" ] || die "two artifacts contain a file named $name"
-			cp -p "$artifact/$name" "$dst/$name"
+			if [ "$mode" = move ]; then
+				mv "$artifact/$name" "$dst/$name"
+			else
+				cp -p "$artifact/$name" "$dst/$name"
+			fi
 		done <<EOF
 $names
 EOF
@@ -269,7 +404,7 @@ make_verify_keyring() {
 # detached signature on FILE from a key on the allowlist. An expired key, a
 # revoked key, and a second signature all fail.
 verify_detached() {
-	local sig="$1" file="$2" status rc=0 good valid bad class primary
+	local sig="$1" file="$2" status rc=0 good valid bad class primary unknown
 	[ -f "$sig" ] || {
 		log "signature file is missing: ${sig##*/}"
 		return 1
@@ -280,6 +415,13 @@ verify_detached() {
 	valid="$(printf '%s\n' "$status" | grep -c '^\[GNUPG:\] VALIDSIG ' || true)"
 	bad="$(printf '%s\n' "$status" | grep -cE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|NO_PUBKEY) ' || true)"
 	if [ "$rc" != 0 ] || [ "$good" != 1 ] || [ "$valid" != 1 ] || [ "$bad" != 0 ]; then
+		# ERRSIG with code 9 means: the public key is missing.
+		unknown="$(printf '%s\n' "$status" | awk '
+			$1 == "[GNUPG:]" && $2 == "NO_PUBKEY" { print $3 }
+			$1 == "[GNUPG:]" && $2 == "ERRSIG" && $8 == "9" { print $3 }' | LC_ALL=C sort -u | tr '\n' ' ')"
+		if [ -n "$unknown" ]; then
+			log "${sig##*/}: an unknown key signed it (key id ${unknown% }). Its public key is not in the signer keys directory $CFG_SIGNER_KEYS_DIR."
+		fi
 		log "no single good signature in ${sig##*/} for ${file##*/}"
 		return 1
 	fi
@@ -294,20 +436,6 @@ verify_detached() {
 		return 1
 	fi
 	return 0
-}
-
-# verify_updater_sig PUBKEY_FILE SIG_FILE FILE: checks a Tauri updater
-# signature. SIG_FILE holds a base64-encoded minisign signature.
-verify_updater_sig() {
-	local pubkey="$1" sig="$2" file="$3" decoded rc=0
-	decoded="$(mktemp)"
-	if ! base64 --decode <"$sig" >"$decoded" 2>/dev/null; then
-		rm -f "$decoded"
-		return 1
-	fi
-	minisign -V -q -p "$pubkey" -x "$decoded" -m "$file" >/dev/null 2>&1 || rc=$?
-	rm -f "$decoded"
-	return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -392,27 +520,120 @@ require_build_run() {
 
 # download_build_artifacts REPO RUN_ID DST: downloads the release artifacts of a
 # build run and puts all files into DST.
+#
+# The downloads run in parallel, one per artifact. The temp download directory
+# is DST.download, next to DST, so the cleanup of the caller removes it.
 download_build_artifacts() {
-	local repo="$1" run_id="$2" dst="$3" raw
-	raw="$(mktemp -d)"
-	gh run download "$run_id" --repo "$repo" --dir "$raw" --pattern "$CFG_ARTIFACT_PATTERN" ||
-		die "cannot download the artifacts of run $run_id"
-	flatten_artifacts "$raw" "$dst"
+	local repo="$1" run_id="$2" dst="$3" raw="$3.download" all names="" name duplicates jobs="" pid failed=""
+	[ ! -e "$raw" ] && [ ! -L "$raw" ] || die "$raw exists already"
+	all="$(gh api --paginate "repos/$repo/actions/runs/$run_id/artifacts?per_page=100" --jq '.artifacts[].name')" ||
+		die "cannot list the artifacts of run $run_id"
+	while IFS= read -r name; do
+		[ -n "$name" ] || continue
+		# shellcheck disable=SC2254 # the pattern is a glob on purpose
+		case "$name" in
+		$CFG_ARTIFACT_PATTERN) ;;
+		*) continue ;;
+		esac
+		valid_asset_name "$name" || die "run $run_id has an artifact with a name that is not allowed: $name"
+		names="$names$name"$'\n'
+	done <<EOF
+$all
+EOF
+	[ -n "$names" ] || die "run $run_id has no artifact that matches $CFG_ARTIFACT_PATTERN"
+	duplicates="$(printf '%s' "$names" | LC_ALL=C sort | uniq -d)"
+	[ -z "$duplicates" ] || die "run $run_id has more than one artifact named $duplicates"
+	mkdir "$raw"
+	while IFS= read -r name; do
+		[ -n "$name" ] || continue
+		gh run download "$run_id" --repo "$repo" --name "$name" --dir "$raw/$name" </dev/null >&2 &
+		jobs="$jobs$! $name"$'\n'
+	done <<EOF
+$names
+EOF
+	while IFS=' ' read -r pid name; do
+		[ -n "$pid" ] || continue
+		wait "$pid" || failed="$failed $name"
+	done <<EOF
+$jobs
+EOF
+	[ -z "$failed" ] || die "cannot download these artifacts of run $run_id:$failed"
+	flatten_artifacts move "$raw" "$dst"
 	rm -rf "$raw"
 }
 
-# check_build_info FILE REPO TAG COMMIT RUN_ID: the build info file ties the
-# files to one repository, tag, commit, and build run.
+# check_build_info FILE REPO TAG COMMIT RUN_ID [HINT]: the build info file ties
+# the files to one repository, tag, commit, and build run. HINT goes at the end
+# of the error message.
 check_build_info() {
-	local file="$1" problem
-	[ -f "$file" ] || die "$BUILD_INFO_NAME is missing"
+	local file="$1" hint="${6:-}" problem
+	[ -f "$file" ] || die "$BUILD_INFO_NAME is missing${hint:+. $hint}"
 	problem="$(jq -r --arg repo "$2" --arg tag "$3" --arg commit "$4" --arg run "$5" '
-		if .repository != $repo then "repository is \(.repository)"
-		elif .tag != $tag then "tag is \(.tag)"
-		elif .commit != $commit then "commit is \(.commit)"
-		elif (.run_id | tostring) != $run then "build run is \(.run_id)"
+		if .repository != $repo then "repository is \(.repository), not \($repo)"
+		elif .tag != $tag then "tag is \(.tag), not \($tag)"
+		elif .commit != $commit then "commit is \(.commit), not \($commit)"
+		elif (.run_id | tostring) != $run then "build run is \(.run_id), not \($run)"
 		else "" end' "$file")" || die "$BUILD_INFO_NAME is not valid JSON"
-	[ -z "$problem" ] || die "$BUILD_INFO_NAME does not match this release: $problem"
+	[ -z "$problem" ] || die "$BUILD_INFO_NAME does not match this release: $problem${hint:+. $hint}"
+}
+
+# ---------------------------------------------------------------------------
+# Build run selection. The tag in the build info of a run is a hint only: it
+# picks the run before the passphrase prompt. The attested build manifest,
+# after the full download, stays the proof.
+# ---------------------------------------------------------------------------
+
+BUILD_MANIFEST_ARTIFACT="release-build-manifest"
+
+# build_run_tag REPO RUN_ID SCRATCH: downloads only the small build manifest
+# artifact of a run into a new directory in SCRATCH, and prints the tag that
+# its build info names.
+build_run_tag() {
+	local repo="$1" run_id="$2" dir="$3/run-$2-info" tag
+	mkdir "$dir" || return 1
+	gh run download "$run_id" --repo "$repo" --name "$BUILD_MANIFEST_ARTIFACT" --dir "$dir" </dev/null >/dev/null 2>&1 ||
+		return 1
+	tag="$(jq -er '.tag | strings' "$dir/$BUILD_INFO_NAME" 2>/dev/null)" || return 1
+	valid_tag "$tag" || return 1
+	printf '%s\n' "$tag"
+}
+
+# select_build_run REPO COMMIT TAG SCRATCH: sets BUILD_RUN_ID to the newest
+# successful build run of COMMIT whose build info names TAG.
+select_build_run() {
+	local repo="$1" commit="$2" tag="$3" scratch="$4" runs id found_tag found=""
+	runs="$(gh api --paginate "repos/$repo/actions/workflows/$CFG_BUILD_WORKFLOW/runs?head_sha=$commit&status=success&per_page=100" \
+		--jq '.workflow_runs[] | "\(.created_at) \(.id)"')" ||
+		die "cannot list the runs of $CFG_BUILD_WORKFLOW"
+	runs="$(printf '%s\n' "$runs" | sed '/^$/d' | LC_ALL=C sort -k1,1r -k2,2nr | cut -d' ' -f2)"
+	[ -n "$runs" ] || die "no successful run of $CFG_BUILD_WORKFLOW for commit $commit. Wait for the build, or pass --run-id."
+	BUILD_RUN_ID=""
+	while IFS= read -r id; do
+		[[ "$id" =~ ^[0-9]+$ ]] || die "the run list holds a run id that is not a number: $id"
+		if found_tag="$(build_run_tag "$repo" "$id" "$scratch")"; then
+			if [ "$found_tag" = "$tag" ]; then
+				BUILD_RUN_ID="$id"
+				return 0
+			fi
+			found="$found"$'\n'"    run $id: tag $found_tag"
+		else
+			found="$found"$'\n'"    run $id: no readable $BUILD_INFO_NAME"
+		fi
+	done <<EOF
+$runs
+EOF
+	die "no successful run of $CFG_BUILD_WORKFLOW for commit $commit built tag $tag. The runs of this commit built:$found
+Build tag $tag, or pass --run-id."
+}
+
+# require_run_tag REPO RUN_ID TAG SCRATCH: fails unless the build info of the
+# run names TAG.
+require_run_tag() {
+	local repo="$1" run_id="$2" tag="$3" scratch="$4" found_tag
+	found_tag="$(build_run_tag "$repo" "$run_id" "$scratch")" ||
+		die "cannot read $BUILD_INFO_NAME (artifact $BUILD_MANIFEST_ARTIFACT) of build run $run_id"
+	[ "$found_tag" = "$tag" ] ||
+		die "build run $run_id built tag $found_tag, not tag $tag. Pass the --run-id of a build of $tag, or leave --run-id out."
 }
 
 # download_release_assets REPO RELEASE_JSON DST [NAME...]: downloads assets of
@@ -454,20 +675,6 @@ EOF2
 # ---------------------------------------------------------------------------
 # Local signing setup
 # ---------------------------------------------------------------------------
-
-# find_tauri_cli: sets the array TAURI_CLI to the command that runs the Tauri
-# CLI: RELEASE_TAURI_CLI, else cargo-tauri, else "cargo tauri".
-find_tauri_cli() {
-	if [ -n "${RELEASE_TAURI_CLI:-}" ]; then
-		read -r -a TAURI_CLI <<<"$RELEASE_TAURI_CLI"
-	elif command -v cargo-tauri >/dev/null 2>&1; then
-		TAURI_CLI=(cargo-tauri)
-	elif cargo tauri --version >/dev/null 2>&1; then
-		TAURI_CLI=(cargo tauri)
-	else
-		die "the Tauri CLI is missing. Install cargo-tauri, or set RELEASE_TAURI_CLI."
-	fi
-}
 
 # select_signing_key: sets SIGNING_KEY to the primary fingerprint of the PGP
 # key to sign with: RELEASE_SIGNING_KEY, or the one local secret key that the

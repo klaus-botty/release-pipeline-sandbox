@@ -8,6 +8,8 @@
   "updater": {
     "pubkey_file": "src-tauri/tauri.conf.json",
     "pubkey_jq": ".plugins.updater.pubkey",
+    "version_file": "src-tauri/tauri.conf.json",
+    "version_jq": ".version",
     "targets": [
       { "pattern": "*_amd64.AppImage", "platforms": ["linux-x86_64", "linux-x86_64-appimage"] },
       { "pattern": "*_amd64.deb", "platforms": ["linux-x86_64-deb"] },

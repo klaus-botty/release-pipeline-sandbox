@@ -17,8 +17,9 @@
 #                         one local secret key that is on the allowlist.
 #   RELEASE_SECRETS_FILE  the encrypted secrets file. Default:
 #                         ~/.config/release-signing/<owner>__<name>.json.gpg
-#   RELEASE_TAURI_CLI     command that runs the Tauri CLI. Default: cargo-tauri,
-#                         or "cargo tauri".
+#
+# Without --run-id, the script takes the newest successful build run of the
+# release commit whose build info names TAG.
 
 set -euo pipefail
 
@@ -75,8 +76,10 @@ repo="${repo:-$CFG_REPOSITORY}"
 [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "repository is not OWNER/NAME: $repo"
 
 use_updater=0
-[ "$(updater_target_count)" = 0 ] || use_updater=1
-[ "$use_updater" = 0 ] || find_tauri_cli
+if uses_updater; then
+	use_updater=1
+	set_release_version "$tag"
+fi
 
 gh auth status >/dev/null 2>&1 || die "gh is not logged in. Run: gh auth login"
 [ "$(gh api "repos/$repo" --jq .permissions.push)" = "true" ] ||
@@ -92,15 +95,7 @@ release_url="$(printf '%s' "$release" | jq -r .html_url)"
 branch="${CFG_RELEASE_BRANCH:-$(default_branch "$repo")}"
 require_commit_on_branch "$repo" "$commit" "$branch"
 require_tag_matches "$repo" "$tag" "$commit"
-
-if [ -z "$run_id" ]; then
-	run_id="$(gh api "repos/$repo/actions/workflows/$CFG_BUILD_WORKFLOW/runs?head_sha=$commit&status=success&per_page=100" \
-		--jq '.workflow_runs | sort_by(.created_at) | last | .id // empty')" ||
-		die "cannot list the runs of $CFG_BUILD_WORKFLOW"
-	[ -n "$run_id" ] || die "no successful run of $CFG_BUILD_WORKFLOW for commit $commit. Wait for the build, or pass --run-id."
-fi
-[[ "$run_id" =~ ^[0-9]+$ ]] || die "build run id is not a number: $run_id"
-require_build_run "$repo" "$run_id" "$commit"
+[ "$use_updater" = 0 ] || require_app_version "$repo" "$commit" "$RELEASE_VERSION"
 
 work="$(mktemp -d)"
 cleanup() {
@@ -112,6 +107,18 @@ cleanup() {
 	fi
 }
 trap cleanup EXIT
+mkdir "$work/runs"
+
+# The tag in the build info of a run is a hint that picks the run. The attested
+# build manifest, after the download, is the proof.
+if [ -z "$run_id" ]; then
+	select_build_run "$repo" "$commit" "$tag" "$work/runs"
+	run_id="$BUILD_RUN_ID"
+else
+	[[ "$run_id" =~ ^[0-9]+$ ]] || die "build run id is not a number: $run_id"
+	require_run_tag "$repo" "$run_id" "$tag" "$work/runs"
+fi
+require_build_run "$repo" "$run_id" "$commit"
 make_verify_keyring "$work/keyring"
 
 select_signing_key
@@ -123,6 +130,7 @@ fi
 
 log "    repository:  $repo"
 log "    release:     $tag (draft)  $release_url"
+[ "$use_updater" = 0 ] || log "    version:     $RELEASE_VERSION"
 log "    commit:      $commit (on $branch)"
 log "    build run:   https://github.com/$repo/actions/runs/$run_id"
 log "    signing key: $SIGNING_KEY"
@@ -139,11 +147,6 @@ fi
 
 pgp_sign() {
 	gpg --batch --yes --local-user "$SIGNING_KEY" --armor --detach-sign --output "$1.asc" "$1" </dev/null
-}
-
-updater_sign() {
-	TAURI_SIGNING_PRIVATE_KEY="$tauri_key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$tauri_key_password" \
-		"${TAURI_CLI[@]}" signer sign "$1" >/dev/null </dev/null
 }
 
 tauri_key="" tauri_key_password=""
@@ -164,9 +167,11 @@ verify_detached "$work/selftest.asc" "$work/selftest" ||
 	die "a signature of $SIGNING_KEY does not pass the release check (is the key expired, or missing in $CFG_SIGNER_KEYS_DIR?)"
 if [ "$use_updater" = 1 ]; then
 	write_updater_pubkey "$work/updater.pub"
-	updater_sign "$work/selftest" || die "the Tauri CLI cannot sign with the updater key in $secrets_file"
-	verify_updater_sig "$work/updater.pub" "$work/selftest.sig" "$work/selftest" ||
+	updater_sign "$tauri_key" "$tauri_key_password" "$work/selftest" "$RELEASE_VERSION" ||
+		die "minisign cannot sign with the updater key in $secrets_file"
+	selftest_comment="$(updater_sig_comment "$work/updater.pub" "$work/selftest.sig" "$work/selftest")" ||
 		die "the updater key in $secrets_file does not match the updater public key of the app"
+	check_updater_comment selftest.sig "$selftest_comment" selftest "$RELEASE_VERSION"
 fi
 phase_done "unlock"
 
@@ -190,7 +195,8 @@ gh attestation verify "$build_manifest" --repo "$repo" \
 	die "$BUILD_MANIFEST_NAME has no valid attestation from $CFG_BUILD_WORKFLOW at commit $commit"
 check_manifest "$build_manifest"
 check_files_against_manifest "$assets" "$build_manifest"
-check_build_info "$assets/$BUILD_INFO_NAME" "$repo" "$tag" "$commit" "$run_id"
+check_build_info "$assets/$BUILD_INFO_NAME" "$repo" "$tag" "$commit" "$run_id" \
+	"Build run $run_id is not the build of $tag. Pass --run-id with the build run of $tag."
 phase_done "provenance check"
 
 # ---------------------------------------------------------------------------
@@ -210,7 +216,7 @@ if [ "$use_updater" = 1 ]; then
 	step "Making the updater signatures"
 	asset_names="$(list_dir "$assets")"
 	latest="$work/latest.json"
-	jq -n --arg version "${tag#v}" --arg notes "$(printf '%s' "$release" | jq -r '.body // ""')" \
+	jq -n --arg version "$RELEASE_VERSION" --arg notes "$(printf '%s' "$release" | jq -r '.body // ""')" \
 		--arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		'{version: $version, notes: $notes, pub_date: $date, platforms: {}}' >"$latest"
 	count="$(updater_target_count)"
@@ -230,9 +236,9 @@ if [ "$use_updater" = 1 ]; then
 		if [ -z "$match" ]; then
 			log "    no file matches $pattern. latest.json gets no entry for it."
 		else
-			updater_sign "$assets/$match" || die "cannot make the updater signature of $match"
-			verify_updater_sig "$work/updater.pub" "$assets/$match.sig" "$assets/$match" ||
-				die "the new updater signature of $match is not valid"
+			updater_sign "$tauri_key" "$tauri_key_password" "$assets/$match" "$RELEASE_VERSION" ||
+				die "cannot make the updater signature of $match"
+			verify_updater_sig "$work/updater.pub" "$assets/$match.sig" "$assets/$match" "$RELEASE_VERSION"
 			while IFS= read -r platform; do
 				jq --arg p "$platform" --arg url "https://github.com/$repo/releases/download/$tag/$match" \
 					--rawfile sig "$assets/$match.sig" \
@@ -277,6 +283,9 @@ step "Uploading the signatures to the draft release"
 upload=()
 final_names="$(list_dir "$assets")"
 while IFS= read -r name; do
+	case "$name" in
+	"$MANIFEST_NAME" | "$MANIFEST_SIG_NAME") continue ;;
+	esac
 	hash="$(sha256_of "$assets/$name")"
 	if [ "$(manifest_hash "$build_manifest" "$name")" != "$hash" ]; then
 		upload+=("$assets/$name")
@@ -295,9 +304,15 @@ strays="$(LC_ALL=C comm -23 <(printf '%s\n' "$draft_names") <(printf '%s\n' "$fi
 [ -z "$strays" ] ||
 	die "the draft release holds files that are not part of this release: $(printf '%s' "$strays" | tr '\n' ' '). Look at them, delete them by hand, then run this script again."
 
-gh release upload "$tag" --repo "$repo" --clobber "${upload[@]}" >/dev/null ||
-	die "upload failed. Run this script again."
-log "    uploaded ${#upload[@]} files"
+# Two calls: the manifest pair goes last. An interrupted upload then leaves no
+# new manifest on the draft, and the finalize workflow refuses the draft.
+if [ "${#upload[@]}" -gt 0 ]; then
+	gh release upload "$tag" --repo "$repo" --clobber "${upload[@]}" >/dev/null ||
+		die "upload failed. The draft has no new $MANIFEST_NAME. Run this script again."
+fi
+gh release upload "$tag" --repo "$repo" --clobber "$assets/$MANIFEST_NAME" "$assets/$MANIFEST_SIG_NAME" >/dev/null ||
+	die "upload of $MANIFEST_NAME and $MANIFEST_SIG_NAME failed. Run this script again."
+log "    uploaded $((${#upload[@]} + 2)) files"
 phase_done "upload"
 
 # ---------------------------------------------------------------------------

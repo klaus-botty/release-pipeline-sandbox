@@ -8,8 +8,12 @@
 #     same hashes,
 #   - release-build-info.json names this repository, tag, commit, and build run,
 #   - every release file has a good detached signature (<file>.asc),
-#   - every updater file has a good updater signature (<file>.sig),
-#   - latest.json matches the updater files and their signatures.
+#   - every updater file has a good updater signature (<file>.sig), and its
+#     trusted comment names exactly this file and the release version,
+#   - latest.json matches the release version, the updater files, and their
+#     signatures.
+#
+# The release version is the tag without one leading "v".
 #
 # Usage: verify-release.sh --dir DIR --repo OWNER/NAME --tag TAG --commit SHA
 #                          --run-id ID [--repo-root DIR]
@@ -45,6 +49,9 @@ valid_commit "$commit" || die "commit is not a full SHA: $commit"
 need_tools gpg jq minisign base64
 load_config
 load_allowed_signers
+if uses_updater; then
+	set_release_version "$tag"
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -89,8 +96,7 @@ while IFS= read -r name; do
 				has_updater_assets=1
 			fi
 			[ -f "$dir/$name.sig" ] || die "$name has no updater signature ($name.sig)"
-			verify_updater_sig "$pubkey" "$dir/$name.sig" "$dir/$name" ||
-				die "the updater signature of $name does not match the updater public key of the app"
+			verify_updater_sig "$pubkey" "$dir/$name.sig" "$dir/$name" "$RELEASE_VERSION"
 		fi
 		;;
 	esac
@@ -100,7 +106,9 @@ done <<<"$names"
 if [ "$has_updater_assets" = 1 ]; then
 	latest="$dir/latest.json"
 	[ -f "$latest" ] || die "latest.json is missing"
-	[ "$(jq -r .version "$latest")" = "${tag#v}" ] || die "latest.json has the wrong version"
+	latest_version="$(jq -r .version "$latest")"
+	[ "$latest_version" = "$RELEASE_VERSION" ] ||
+		die "latest.json has the wrong version: $latest_version, but the release version is $RELEASE_VERSION"
 	expected_platforms=""
 	count="$(updater_target_count)"
 	i=0
