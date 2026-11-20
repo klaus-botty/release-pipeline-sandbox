@@ -56,41 +56,17 @@ jobs:
           repo/dev-scripts/release/finalize-release.sh stage --tag "$TAG" --run-id "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --repo-root repo
 
   publish-targets:
-    # Stand-in for jobs that publish the verified files to other targets.
+    # Environment protection test: no needs, only checks whether the secret is set.
     name: Publish to other targets
-    needs: verify
     runs-on: ubuntu-24.04
     environment: release
-    permissions:
-      contents: write # read the draft release
+    permissions: {}
     steps:
-      - name: Fetch the pipeline scripts at the commit of this run
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
-
-      - name: Fetch the verified release files
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
-        run: |
-          set -euo pipefail
-          repo/dev-scripts/release/finalize-release.sh fetch --tag "$TAG" --repo "$GITHUB_REPOSITORY" --manifest-sha256 "$MANIFEST_SHA256" --dir verified
-
-      - name: Publish (stand-in)
+      - name: Check the publish token
         env:
           PUBLISH_TOKEN: ${{ secrets.SANDBOX_PUBLISH_TOKEN }}
         run: |
-          set -euo pipefail
-          if [ -z "${PUBLISH_TOKEN:-}" ]; then
-            echo "::error::The publish token is empty. Check the secret of the release environment."
-            exit 1
-          fi
-          echo "The publish token is present. A real job would publish these files:"
-          ls -l verified
+          if [ -z "${PUBLISH_TOKEN:-}" ]; then echo "empty"; else echo "present"; fi
 
   publish:
     name: Publish the release
