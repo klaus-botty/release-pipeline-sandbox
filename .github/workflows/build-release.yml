@@ -1,0 +1,134 @@
+name: Build release
+run-name: Build release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v1.2.3
+        type: string
+        required: true
+      attest:
+        description: Test switch of this sandbox. false builds without attestation.
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  draft-release:
+    name: Create or check the draft release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the draft release
+    steps:
+      - name: Create the draft release or check the existing one
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+            echo "::error::Invalid tag: '$TAG'"
+            exit 1
+          fi
+          matches="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | jq -s --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]')"
+          count="$(jq 'length' <<<"$matches")"
+          if [ "$count" -eq 0 ]; then
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$TAG" --notes "Release $TAG"
+            echo "Created draft release $TAG at $GITHUB_SHA."
+            exit 0
+          fi
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Found $count releases with tag $TAG. Expected at most one."
+            exit 1
+          fi
+          draft="$(jq -r '.[0].draft' <<<"$matches")"
+          target="$(jq -r '.[0].target_commitish' <<<"$matches")"
+          if [ "$draft" != "true" ]; then
+            echo "::error::Release $TAG exists and is not a draft. Refusing to build into it."
+            exit 1
+          fi
+          if [ "$target" != "$GITHUB_SHA" ]; then
+            echo "::error::Draft release $TAG targets '$target', but this run builds $GITHUB_SHA."
+            exit 1
+          fi
+          echo "Draft release $TAG already exists at $GITHUB_SHA. Continuing."
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: draft-release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-24.04
+          - name: macos
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build
+        env:
+          NAME: ${{ matrix.name }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ./sandbox/fake-build.sh "$NAME" "${TAG#v}" dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  manifest:
+    name: Build manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # sign the attestation
+      attestations: write # store the attestation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: artifacts
+
+      - name: Build the manifest
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ./dev-scripts/release/build-manifest.sh --artifacts artifacts --out manifest --tag "$TAG"
+
+      - name: Attest the manifest
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: manifest/BUILD-SHA256SUMS
+
+      - name: Attest every file in the manifest
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: manifest/BUILD-SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-build-manifest
+          path: manifest/
+          if-no-files-found: error

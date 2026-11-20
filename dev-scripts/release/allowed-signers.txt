@@ -1,0 +1,5 @@
+# Primary key fingerprints that may sign a release.
+# One full primary key fingerprint per line. "#" starts a comment.
+
+# Sandbox Signer <signer@example.invalid>
+D43E8EEF6859EFBFA187BA9F01A061BFFEE1FDFF

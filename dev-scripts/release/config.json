@@ -1,0 +1,19 @@
+{
+  "repository": "klaus-botty/release-pipeline-sandbox",
+  "build_workflow": "build-release.yml",
+  "finalize_workflow": "finalize-release.yml",
+  "artifact_pattern": "release-*",
+  "signer_keys_dir": "utils/gpg_keys",
+  "allowed_signers": "dev-scripts/release/allowed-signers.txt",
+  "updater": {
+    "pubkey_file": "src-tauri/tauri.conf.json",
+    "pubkey_jq": ".plugins.updater.pubkey",
+    "targets": [
+      { "pattern": "*_amd64.AppImage", "platforms": ["linux-x86_64", "linux-x86_64-appimage"] },
+      { "pattern": "*_amd64.deb", "platforms": ["linux-x86_64-deb"] },
+      { "pattern": "*_x64-setup.exe", "platforms": ["windows-x86_64", "windows-x86_64-nsis"] },
+      { "pattern": "*_aarch64.app.tar.gz", "platforms": ["darwin-aarch64", "darwin-aarch64-app"] },
+      { "pattern": "*_x64.app.tar.gz", "platforms": ["darwin-x86_64", "darwin-x86_64-app"] }
+    ]
+  }
+}

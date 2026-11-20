@@ -1,0 +1,131 @@
+# This workflow uses no actions (no `uses:` anywhere). Its jobs hold write
+# tokens and publish credentials, so they run only tools of the runner image
+# and scripts of this repository. Each job fetches the scripts as a tarball
+# of the commit of this run instead of using actions/checkout.
+name: Finalize release
+run-name: Finalize release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the signed draft release
+        type: string
+        required: true
+      build_run_id:
+        description: ID of the build workflow run that made the release files
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: finalize-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify the signed draft release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # read the draft release and add files to it
+      actions: read # read the artifacts of the build run
+    outputs:
+      manifest_sha256: ${{ steps.stage.outputs.manifest_sha256 }}
+    steps:
+      - name: Fetch the pipeline scripts at the commit of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
+
+      - name: Install minisign
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q minisign
+
+      - name: Verify and stage the release
+        id: stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          repo/dev-scripts/release/finalize-release.sh stage --tag "$TAG" --run-id "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --repo-root repo
+
+  publish-targets:
+    # Stand-in for jobs that publish the verified files to other targets.
+    name: Publish to other targets
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write # read the draft release
+    steps:
+      - name: Fetch the pipeline scripts at the commit of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
+
+      - name: Fetch the verified release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          repo/dev-scripts/release/finalize-release.sh fetch --tag "$TAG" --repo "$GITHUB_REPOSITORY" --manifest-sha256 "$MANIFEST_SHA256" --dir verified
+
+      - name: Publish (stand-in)
+        env:
+          PUBLISH_TOKEN: ${{ secrets.SANDBOX_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PUBLISH_TOKEN:-}" ]; then
+            echo "::error::The publish token is empty. Check the secret of the release environment."
+            exit 1
+          fi
+          echo "The publish token is present. A real job would publish these files:"
+          ls -l verified
+
+  publish:
+    name: Publish the release
+    needs: [verify, publish-targets]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # publish the release
+      actions: write # read the build run and start the follow-up workflow
+    steps:
+      - name: Fetch the pipeline scripts at the commit of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
+
+      - name: Install minisign
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q minisign
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          repo/dev-scripts/release/finalize-release.sh publish --tag "$TAG" --run-id "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --manifest-sha256 "$MANIFEST_SHA256" --repo-root repo
+
+      - name: Start the post-release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run post-release.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f tag="$TAG"
