@@ -291,7 +291,7 @@ done <<<"$final_names"
 # failure stops the script.
 draft_names="$(find_release "$repo" "$tag" | jq -r '.assets[].name' | LC_ALL=C sort)"
 final_names="$(list_dir "$assets")"
-strays="$(comm -23 <(printf '%s\n' "$draft_names") <(printf '%s\n' "$final_names") | grep -v '^$' || true)"
+strays="$(LC_ALL=C comm -23 <(printf '%s\n' "$draft_names") <(printf '%s\n' "$final_names") | grep -v '^$' || true)"
 [ -z "$strays" ] ||
 	die "the draft release holds files that are not part of this release: $(printf '%s' "$strays" | tr '\n' ' '). Look at them, delete them by hand, then run this script again."
 

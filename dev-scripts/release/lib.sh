@@ -194,9 +194,9 @@ check_files_against_manifest() {
 		present="$(printf '%s\n' "$present" | grep -vxF -- "$ignored" || true)"
 	done
 	expected="$(manifest_names "$manifest")"
-	skip="$(comm -23 <(printf '%s\n' "$present") <(printf '%s\n' "$expected"))"
+	skip="$(LC_ALL=C comm -23 <(printf '%s\n' "$present") <(printf '%s\n' "$expected"))"
 	[ -z "$skip" ] || die "files that the manifest does not list: $(printf '%s' "$skip" | tr '\n' ' ')"
-	skip="$(comm -13 <(printf '%s\n' "$present") <(printf '%s\n' "$expected"))"
+	skip="$(LC_ALL=C comm -13 <(printf '%s\n' "$present") <(printf '%s\n' "$expected"))"
 	[ -z "$skip" ] || die "files that the manifest lists but that are missing: $(printf '%s' "$skip" | tr '\n' ' ')"
 	while IFS= read -r name; do
 		[ -n "$name" ] || continue
@@ -481,7 +481,7 @@ select_signing_key() {
 	else
 		secret_keys="$(gpg --batch --list-secret-keys --with-colons 2>/dev/null |
 			awk -F: '$1 == "sec" { want = 1 } $1 == "fpr" && want { print $10; want = 0 }')" || true
-		SIGNING_KEY="$(comm -12 <(printf '%s\n' "$secret_keys" | LC_ALL=C sort) <(printf '%s\n' "$ALLOWED_SIGNERS" | LC_ALL=C sort))"
+		SIGNING_KEY="$(LC_ALL=C comm -12 <(printf '%s\n' "$secret_keys" | LC_ALL=C sort) <(printf '%s\n' "$ALLOWED_SIGNERS" | LC_ALL=C sort))"
 		[ -n "$SIGNING_KEY" ] || die "none of your secret keys is on the allowlist ($CFG_ALLOWED_SIGNERS)"
 		[ "$(printf '%s\n' "$SIGNING_KEY" | wc -l | tr -d ' ')" = 1 ] ||
 			die "several of your secret keys are on the allowlist. Set RELEASE_SIGNING_KEY."
