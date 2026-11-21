@@ -1,0 +1,4 @@
+# Refs of the dummy app beyond the conventional ones (app, .Debug, appstream,
+# appstream2): the locale extension and the runtime.
+runtime/org.example.SandboxApp.Locale/x86_64/stable
+runtime/org.example.Platform/x86_64/1

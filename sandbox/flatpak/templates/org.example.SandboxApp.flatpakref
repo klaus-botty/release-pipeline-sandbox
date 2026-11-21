@@ -1,0 +1,11 @@
+[Flatpak Ref]
+Url=%Url%
+Icon=%Url%/icon.png
+SuggestRemoteName=sandbox
+Homepage=%Homepage%
+GPGKey=%GPGKey%
+
+Title=Sandbox App
+Name=org.example.SandboxApp
+Branch=stable
+IsRuntime=false

@@ -1,0 +1,135 @@
+# Probe: step 3 of the Flatpak pipeline on a real runner. Verifies the
+# signatures from the data branch against the repository artifact of a build
+# run, runs flatpak-finalize.sh, and publishes the result to gh-pages.
+#
+# The finalize job holds read tokens only. The publish job holds only
+# contents: write and runs no repository script: it unpacks the verified
+# artifact and pushes it.
+name: Probe flatpak finalize
+run-name: Probe flatpak finalize ${{ inputs.build_run_id }} ${{ inputs.signatures_path }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: ID of the probe-flatpak-build run
+        type: string
+        required: true
+      signatures_path:
+        description: Path of the signatures archive in the probe-flatpak-data branch
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: probe-flatpak-pages
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    name: Verify, attach, and build the pages
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # the scripts of this commit and the data branch
+      actions: read # the artifacts of the build run
+    steps:
+      - name: Fetch the scripts at the commit of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
+
+      - name: Install the tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends flatpak ostree gir1.2-ostree-1.0 python3-gi gnupg
+          flatpak --version && ostree --version | head -n 2
+
+      - name: Fetch the repository artifact and the signatures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          SIG_PATH: ${{ inputs.signatures_path }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::build_run_id is not a run id"; exit 1; }
+          [[ "$SIG_PATH" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*\.tar$ && "$SIG_PATH" != *..* ]] ||
+            { echo "::error::signatures_path is not allowed"; exit 1; }
+          run="$(gh run view "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,conclusion,headSha \
+            --jq '"\(.workflowName) \(.conclusion) \(.headSha)"')"
+          echo "build run: $run"
+          [[ "$run" == "Probe flatpak build success "* ]] ||
+            { echo "::error::run $BUILD_RUN_ID is not a successful probe flatpak build"; exit 1; }
+          mkdir in
+          gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --name flatpak-repo --dir in
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$GITHUB_REPOSITORY/contents/$SIG_PATH?ref=probe-flatpak-data" >in/flatpak-signatures.tar
+          ls -l in
+          sha256sum in/*
+
+      - name: Finalize
+        run: |
+          set -euo pipefail
+          bash -c '. repo/sandbox/flatpak/module/flatpak.sh &&
+            flatpak_expected_refs org.example.SandboxApp x86_64 stable repo/sandbox/flatpak/extra-refs.txt' >in/expected-refs.txt
+          cat in/expected-refs.txt
+          started=$SECONDS
+          repo/sandbox/flatpak/module/flatpak-finalize.sh \
+            --repo-tar in/flatpak-repo.tar \
+            --signatures-tar in/flatpak-signatures.tar \
+            --pubkey repo/utils/gpg_keys/sandbox-signer.asc \
+            --fingerprint D43E8EEF6859EFBFA187BA9F01A061BFFEE1FDFF \
+            --app-id org.example.SandboxApp \
+            --arch x86_64 \
+            --branch stable \
+            --expected-refs in/expected-refs.txt \
+            --bundle-name org.example.SandboxApp.flatpak \
+            --templates repo/sandbox/flatpak/templates \
+            --url "https://$GITHUB_REPOSITORY_OWNER.github.io/${GITHUB_REPOSITORY#*/}" \
+            --homepage "https://github.com/$GITHUB_REPOSITORY" \
+            --out site
+          echo "finalize: $((SECONDS - started)) s"
+          # A tar keeps .nojekyll and the empty directories; upload-artifact
+          # drops hidden files.
+          tar -C site -cf pages.tar .
+          du -sh site pages.tar
+
+      - name: Upload the pages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flatpak-pages
+          path: pages.tar
+          if-no-files-found: error
+
+  publish:
+    name: Push the pages to gh-pages
+    needs: finalize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # push gh-pages
+    steps:
+      - name: Download the pages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: flatpak-pages
+
+      - name: Push a fresh commit to gh-pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir site && tar -C site -xf pages.tar
+          git -C site init -q
+          git -C site add .
+          git -C site config user.name "github-actions[bot]"
+          git -C site config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C site commit -q -m "Flatpak repository from build run $BUILD_RUN_ID"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -C site -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push -f "https://github.com/$GITHUB_REPOSITORY" HEAD:gh-pages
+          git -C site log --oneline -1
+          echo "pushed at $(date -u +%Y-%m-%dT%H:%M:%SZ)"

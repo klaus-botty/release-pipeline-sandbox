@@ -1,0 +1,11 @@
+[Flatpak Repo]
+Url=%Url%
+Icon=%Url%/icon.png
+SuggestRemoteName=sandbox
+Homepage=%Homepage%
+GPGKey=%GPGKey%
+
+Title=Sandbox
+Name=sandbox
+Comment=Dummy repository for release pipeline probes
+Description=Dummy Flatpak repository for release pipeline probes
