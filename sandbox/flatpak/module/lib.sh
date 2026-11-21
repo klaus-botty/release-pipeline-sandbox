@@ -104,6 +104,66 @@ load_config() {
 	CFG_SIGNER_KEYS_DIR="$REPO_ROOT/$(cfg .signer_keys_dir)"
 	CFG_ALLOWED_SIGNERS="$REPO_ROOT/$(cfg .allowed_signers)"
 	CFG_RELEASE_BRANCH="$(cfg_opt .release_branch)"
+	load_platform_config
+}
+
+# load_platform_config: the optional sections apple, flatpak, and homebrew.
+# validate_config checked their structure. CFG_HAS_<SECTION> is 1 or 0.
+load_platform_config() {
+	local fpr
+	CFG_HAS_APPLE=0 CFG_HAS_FLATPAK=0 CFG_HAS_HOMEBREW=0
+	if [ "$(jq 'has("apple")' "$RELEASE_CONFIG")" = true ]; then
+		CFG_HAS_APPLE=1
+		CFG_APPLE_ENTITLEMENTS="$(cfg .apple.entitlements_file)"
+		CFG_APPLE_NOTARIZE="$(jq -r '.apple.notarize | tostring' "$RELEASE_CONFIG")" || die "cannot read apple.notarize"
+		CFG_APPLE_REQUIREMENT="$(cfg .apple.requirement)"
+		CFG_APPLE_TEAM_ID="$(cfg .apple.team_id)"
+		CFG_APPLE_BUNDLE_ID="$(cfg .apple.bundle_id)"
+	fi
+	if [ "$(jq 'has("flatpak")' "$RELEASE_CONFIG")" = true ]; then
+		CFG_HAS_FLATPAK=1
+		CFG_FLATPAK_APP_ID="$(cfg .flatpak.app_id)"
+		CFG_FLATPAK_ARCH="$(cfg .flatpak.arch)"
+		CFG_FLATPAK_BRANCH="$(cfg .flatpak.branch)"
+		fpr="$(cfg .flatpak.fingerprint)"
+		CFG_FLATPAK_FINGERPRINT="$(printf '%s' "$fpr" | tr 'a-f' 'A-F')"
+		CFG_FLATPAK_BUNDLE_NAME="$(cfg .flatpak.bundle_name)"
+		CFG_FLATPAK_TEMPLATES_DIR="$(cfg .flatpak.templates_dir)"
+		CFG_FLATPAK_URL="$(cfg .flatpak.url)"
+		CFG_FLATPAK_HOMEPAGE="$(cfg .flatpak.homepage)"
+		CFG_FLATPAK_TO_SIGN="$(cfg .flatpak.to_sign)"
+		CFG_FLATPAK_REPO_TAR="$(cfg .flatpak.repo_tar)"
+		CFG_FLATPAK_SIGNATURES="$(cfg .flatpak.signatures)"
+		valid_asset_name "$CFG_FLATPAK_BUNDLE_NAME" ||
+			die "the configuration $RELEASE_CONFIG has problems: flatpak.bundle_name is not a valid file name: $CFG_FLATPAK_BUNDLE_NAME"
+		# The Flatpak key signs release content, so it must be a release signer.
+		load_allowed_signers
+		is_allowed_signer "$CFG_FLATPAK_FINGERPRINT" ||
+			die "the configuration $RELEASE_CONFIG has problems: flatpak.fingerprint $CFG_FLATPAK_FINGERPRINT is not on the allowlist $CFG_ALLOWED_SIGNERS"
+	fi
+	if [ "$(jq 'has("homebrew")' "$RELEASE_CONFIG")" = true ]; then
+		CFG_HAS_HOMEBREW=1
+		CFG_HOMEBREW_TEMPLATE="$(cfg .homebrew.template_file)"
+		CFG_HOMEBREW_OUTPUT="$(cfg .homebrew.output)"
+	fi
+}
+
+# flatpak_extra_refs_file OUT_FILE: writes flatpak.extra_refs, one per line.
+flatpak_extra_refs_file() {
+	jq -r '.flatpak.extra_refs // [] | .[]' "$RELEASE_CONFIG" >"$1" || die "cannot read flatpak.extra_refs"
+}
+
+# apple_output_names: the local products that the Apple step makes, from the
+# input products <base>.app.unsigned.tar and <base>.unsigned.dmg.
+apple_output_names() {
+	local names name
+	names="$(product_names input)" || return 1
+	while IFS= read -r name; do
+		case "$name" in
+		*.app.unsigned.tar) printf '%s.app.tar.gz\n' "${name%.app.unsigned.tar}" ;;
+		*.unsigned.dmg) printf '%s.dmg\n' "${name%.unsigned.dmg}" ;;
+		esac
+	done <<<"$names"
 }
 
 # cfg FILTER: prints a required configuration value.
@@ -153,7 +213,74 @@ if type != "object" then "the configuration is not a JSON object" else
 	 elif (.updater | type) != "object" then "updater must be an object, because some products have updater platforms"
 	 else .updater | (["pubkey_file", "pubkey_jq", "version_file", "version_jq"][] as $k |
 		if (.[$k] | nonempty_string) then empty else "updater.\($k) must be a nonempty string" end)
-	 end)
+	 end),
+	([.products[]? | objects | select(.name | nonempty_string)] as $p |
+	 def names($o): [$p[] | select(.origin == $o) | .name];
+	 def one_line: nonempty_string and (test("[\\n\\r]") | not);
+	 def repo_path: nonempty_string and test("^[A-Za-z0-9_][A-Za-z0-9._/-]*$") and
+		(("/" + . + "/") | test("/\\.\\.?/|//") | not);
+	 def keys_exactly($s; $req; $opt):
+		((keys - $req - $opt)[] | "\($s) has an unknown key: \(.)"),
+		(($req - keys)[] | "\($s).\(.) is missing");
+	 def product_of($s; $k; $origins):
+		if (.[$k] | nonempty_string) | not then "\($s).\($k) must be a nonempty string"
+		elif .[$k] as $v | [$origins[] as $o | names($o)[]] | index($v) then empty
+		else "\($s).\($k) is \(.[$k]), which is not a product with the origin \($origins | join(" or ")) in products" end;
+	 (if has("apple") | not then empty
+	  elif (.apple | type) != "object" then "apple must be an object"
+	  else .apple | (
+		keys_exactly("apple"; ["entitlements_file", "notarize", "requirement", "team_id", "bundle_id"]; []),
+		(if has("entitlements_file") and (.entitlements_file | repo_path | not) then "apple.entitlements_file must be a plain relative path in the repository" else empty end),
+		(if has("notarize") and (.notarize | type) != "boolean" then "apple.notarize must be true or false" else empty end),
+		(if has("requirement") and (.requirement | one_line | not) then "apple.requirement must be a nonempty string on one line" else empty end),
+		(if has("team_id") and ((.team_id | type) != "string" or (.team_id | test("^[A-Z0-9]{10}$") | not)) then "apple.team_id must be a team identifier (10 capital letters or digits)" else empty end),
+		(if has("bundle_id") and ((.bundle_id | type) != "string" or (.bundle_id | test("^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$") | not)) then "apple.bundle_id must be a bundle identifier (reverse DNS)" else empty end),
+		(names("input") as $in | names("local") as $loc |
+		 ([$in[] | select(endswith(".app.unsigned.tar"))] | if length == 0 then "apple: products holds no input product <base>.app.unsigned.tar" else empty end),
+		 ($in[] | select(endswith(".app.unsigned.tar")) | (.[:-17] + ".app.tar.gz") as $want |
+			if $loc | index($want) then empty else "apple: the input product \(.) needs the local product \($want)" end),
+		 ($in[] | select(endswith(".unsigned.dmg")) | (.[:-13] + ".dmg") as $want |
+			if $loc | index($want) then empty else "apple: the input product \(.) needs the local product \($want)" end))
+	  ) end),
+	 (if has("flatpak") | not then empty
+	  elif (.flatpak | type) != "object" then "flatpak must be an object"
+	  else .flatpak | (
+		keys_exactly("flatpak"; ["app_id", "arch", "branch", "fingerprint", "bundle_name", "templates_dir", "url", "homepage", "to_sign", "repo_tar", "signatures"]; ["extra_refs"]),
+		(if has("app_id") and ((.app_id | type) != "string" or (.app_id | test("^[A-Za-z_][A-Za-z0-9_-]*(\\.[A-Za-z_][A-Za-z0-9_-]*)+$") | not)) then "flatpak.app_id is not a Flatpak application id" else empty end),
+		(if has("arch") and ((.arch | type) != "string" or (.arch | test("^[A-Za-z0-9_]+$") | not)) then "flatpak.arch is not a Flatpak architecture" else empty end),
+		(if has("branch") and ((.branch | type) != "string" or (.branch | test("^[A-Za-z0-9_][A-Za-z0-9._-]*$") | not)) then "flatpak.branch is not a Flatpak branch name" else empty end),
+		(if has("fingerprint") and ((.fingerprint | type) != "string" or (.fingerprint | test("^([0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$") | not)) then "flatpak.fingerprint must be a full key fingerprint (40 or 64 hex digits, no spaces)" else empty end),
+		(if has("bundle_name") and (.bundle_name | nonempty_string | not) then "flatpak.bundle_name must be a nonempty string" else empty end),
+		(if has("templates_dir") and (.templates_dir | repo_path | not) then "flatpak.templates_dir must be a plain relative path in the repository" else empty end),
+		(["url", "homepage"][] as $k | if has($k) and ((.[$k] | one_line | not) or (.[$k] | test("^https://[^\\s|&\\\\]+$") | not)) then "flatpak.\($k) must be an https URL without white space, |, &, or \\" else empty end),
+		(if has("to_sign") then product_of("flatpak"; "to_sign"; ["input"]) else empty end),
+		(if has("repo_tar") then product_of("flatpak"; "repo_tar"; ["ci"]) else empty end),
+		(if has("signatures") then product_of("flatpak"; "signatures"; ["local"]) else empty end),
+		(if has("extra_refs") | not then empty
+		 elif (.extra_refs | type) != "array" or (.extra_refs | any(type != "string")) then "flatpak.extra_refs must be a list of ref names"
+		 else
+			(.extra_refs[] | select((test("^(app|runtime)/[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_]+/[A-Za-z0-9_][A-Za-z0-9_.-]*$") or test("^appstream2?/[A-Za-z0-9_]+$")) and (test("\\.\\.") | not) | not) |
+				"flatpak.extra_refs: not a Flatpak ref name: \(.)"),
+			(.extra_refs | group_by(.)[] | select(length > 1) | "flatpak.extra_refs lists \(.[0]) more than once"),
+			(. as $f | ["app/\($f.app_id)/\($f.arch)/\($f.branch)", "runtime/\($f.app_id).Debug/\($f.arch)/\($f.branch)", "appstream/\($f.arch)", "appstream2/\($f.arch)"] as $conv |
+				$f.extra_refs[] | select(. as $r | $conv | index($r)) |
+				"flatpak.extra_refs lists \(.), which every release holds already. List only the refs beyond app/<app_id>/<arch>/<branch>, runtime/<app_id>.Debug/<arch>/<branch>, appstream/<arch>, and appstream2/<arch>.")
+		 end)
+	  ) end),
+	 (if has("homebrew") | not then empty
+	  elif (.homebrew | type) != "object" then "homebrew must be an object"
+	  else .homebrew | (
+		keys_exactly("homebrew"; ["template_file", "output", "dmg"]; []),
+		(if has("template_file") and (.template_file | repo_path | not) then "homebrew.template_file must be a plain relative path in the repository" else empty end),
+		(if has("output") then product_of("homebrew"; "output"; ["local"]) else empty end),
+		(if has("dmg") | not then empty
+		 elif (.dmg | type) != "object" or (.dmg | length) == 0 then "homebrew.dmg must be a nonempty object: {\"<arch>\": \"<product name>\"}"
+		 else .dmg | to_entries[] |
+			(if .key | test("^[a-z0-9_]+$") then empty else "homebrew.dmg: the architecture \(.key) must use only a-z, 0-9, and _" end),
+			(if (.value | nonempty_string) and (.value as $v | names("local") + names("build") | index($v)) then empty
+			 else "homebrew.dmg.\(.key) is \(.value), which is not a product with the origin local or build in products" end)
+		 end)
+	  ) end))
 end'
 
 # validate_config: checks the whole configuration once, and sets CFG_PRODUCTS
@@ -990,14 +1117,34 @@ tag_commit() {
 	printf '%s\n' "$sha"
 }
 
-# require_tag_matches REPO TAG COMMIT: a published release uses an existing git
-# tag as it is. So an existing tag must already point to the release commit.
+# release_retry_hint TAG: what a maintainer can do after a failed release.
+# With immutable releases, the tag of a published release never moves, and its
+# name cannot be used again, even after the release is deleted.
+release_retry_hint() {
+	printf '%s' "If release $1 was published already, its tag can never move, and the name $1 cannot be used again (immutable releases): make the next attempt with a new version number. Before publication, a maintainer can delete the tag (git push <remote> --delete refs/tags/$1) and run the signing script again."
+}
+
+# require_tag_matches REPO TAG COMMIT: the signing script creates the git tag
+# of the release. An existing tag must already point to the release commit.
+# Prints "present" or "absent".
 require_tag_matches() {
 	local existing
 	existing="$(tag_commit "$1" "$2")" || die "cannot read the git tag $2"
 	if [ -n "$existing" ] && [ "$existing" != "$3" ]; then
-		die "git tag $2 exists and points to $existing, not to the release commit $3"
+		die "git tag $2 exists and points to $existing, not to the release commit $3. $(release_retry_hint "$2")"
 	fi
+	if [ -n "$existing" ]; then printf 'present\n'; else printf 'absent\n'; fi
+}
+
+# require_tag_on_commit REPO TAG COMMIT: the finalize step never creates a tag.
+# Fails unless the git tag exists and points to the release commit.
+require_tag_on_commit() {
+	local existing
+	existing="$(tag_commit "$1" "$2")" || die "cannot read the git tag $2"
+	[ -n "$existing" ] ||
+		die "git tag $2 does not exist. The signing script creates it on the release commit $3 after its upload, with the login of a maintainer. The finalize workflow never creates a tag. Run the signing script again."
+	[ "$existing" = "$3" ] ||
+		die "git tag $2 points to $existing, not to the release commit $3. $(release_retry_hint "$2")"
 }
 
 # require_build_run REPO RUN_ID COMMIT [BRANCH]: fails unless RUN_ID is a
