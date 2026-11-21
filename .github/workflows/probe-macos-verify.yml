@@ -1,0 +1,38 @@
+name: Probe macOS verify
+
+# Runs sandbox/macos/module/verify-macos.sh on files that were signed on
+# Linux (branch probe-macos-data): one positive case and negative cases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_ref:
+        description: Branch with the probe data
+        type: string
+        default: probe-macos-data
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.data_ref }}
+          path: probe-data
+          persist-credentials: false
+      - name: Trust the throwaway certificates for code signing (test setup only)
+        run: /bin/bash sandbox/macos/trust-cert.sh probe-data/certs/sandbox-signer.crt probe-data/certs/other-signer.crt
+      - name: Run verify-macos.sh (positive and negative cases)
+        run: /bin/bash sandbox/macos/verify-probe.sh "$GITHUB_WORKSPACE/probe-data"
