@@ -15,6 +15,10 @@ on:
         description: Existing tag pushed by a maintainer before the run
         type: string
         default: v9.9.3
+      plain_tag:
+        description: Existing maintainer tag without a release (control)
+        type: string
+        default: v9.9.6
 
 permissions:
   contents: write
@@ -28,6 +32,7 @@ jobs:
       SHA: ${{ github.sha }}
       P: ${{ inputs.prefix }}
       T3: ${{ inputs.published_tag }}
+      PLAIN: ${{ inputs.plain_tag }}
     steps:
       - name: Run probes
         shell: bash
@@ -81,12 +86,18 @@ jobs:
           tagref "$T3"
 
           echo "## 2d update and delete $T3"
-          PARENT=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO/commits/$SHA" | jq -r '.parents[0].sha')
-          api "2d move $T3 (force)" PATCH "repos/$REPO/git/refs/tags/$T3" \
-            "{\"sha\":\"$PARENT\",\"force\":true}"
+          # Move target: the run commit, which differs from the tag commit.
+          api "2d move $T3 to $SHA (force)" PATCH "repos/$REPO/git/refs/tags/$T3" \
+            "{\"sha\":\"$SHA\",\"force\":true}"
           api "2d delete $T3" DELETE "repos/$REPO/git/refs/tags/$T3"
           tagref "$T3"
+
+          echo "## 2f control: update and delete $PLAIN (tag without release)"
+          tagref "$PLAIN"
+          api "2f move $PLAIN to $SHA (force)" PATCH "repos/$REPO/git/refs/tags/$PLAIN" \
+            "{\"sha\":\"$SHA\",\"force\":true}"
+          api "2f delete $PLAIN" DELETE "repos/$REPO/git/refs/tags/$PLAIN"
+          tagref "$PLAIN"
 
           echo "## 2e git push $P.4"
           git init -q probe && cd probe
