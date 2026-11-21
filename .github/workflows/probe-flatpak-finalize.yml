@@ -65,8 +65,11 @@ jobs:
             { echo "::error::run $BUILD_RUN_ID is not a successful probe flatpak build"; exit 1; }
           mkdir in
           gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --name flatpak-repo --dir in
-          gh api -H 'Accept: application/vnd.github.raw+json' \
-            "repos/$GITHUB_REPOSITORY/contents/$SIG_PATH?ref=probe-flatpak-data" >in/flatpak-signatures.tar
+          # JSON with base64 content: gh api fails on a raw binary body
+          # ("transform: short source buffer"), because GitHub labels it utf-8.
+          gh api "repos/$GITHUB_REPOSITORY/contents/$SIG_PATH?ref=probe-flatpak-data" \
+            --jq 'if .type == "file" and .encoding == "base64" then .content else error("not a base64 file") end' |
+            base64 -d >in/flatpak-signatures.tar
           ls -l in
           sha256sum in/*
 
