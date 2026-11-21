@@ -373,12 +373,23 @@ flatpak_sign() (
 	cp "$tmp/refs" "$tmp/sigs/refs.txt"
 
 	# ustar holds the short names, and it has no room for extended attributes.
-	# COPYFILE_DISABLE stops macOS tar from adding ._ files.
+	# COPYFILE_DISABLE stops macOS tar from adding ._ files. The archive
+	# leaves this machine, so it records owner 0 and the time 1970-01-01
+	# instead of the login name of the maintainer and the signing time.
 	{
 		sed 's/$/.sig/' "$tmp/sign"
 		printf '%s\n' refs.txt
 	} >"$tmp/list"
-	(cd "$tmp/sigs" && COPYFILE_DISABLE=1 LC_ALL=C tar --format=ustar -cf "$out.tmp" -T "$tmp/list") ||
+	tar_version="$(tar --version 2>/dev/null </dev/null | head -n 1)" || tar_version=""
+	case "$tar_version" in
+	*"GNU tar"*) owner_opts="--owner=0 --group=0 --numeric-owner" ;;
+	*bsdtar*) owner_opts="--uid 0 --gid 0 --uname root --gname root" ;;
+	*) die "cannot write $out: tar is neither GNU tar nor bsdtar ($tar_version)" ;;
+	esac
+	(cd "$tmp/sigs" && find . -type f -exec env TZ=UTC touch -t 197001010000 {} +) ||
+		die "cannot set the time of the signature files"
+	# shellcheck disable=SC2086 # owner_opts holds several options without spaces in them
+	(cd "$tmp/sigs" && COPYFILE_DISABLE=1 LC_ALL=C tar --format=ustar $owner_opts -cf "$out.tmp" -T "$tmp/list") ||
 		die "cannot write $out"
 	mv "$out.tmp" "$out"
 	log "    approved refs:"
