@@ -1,0 +1,102 @@
+# Probe: what can GITHUB_TOKEN do with release tags while a tag ruleset
+# restricts creation, update and deletion of `v[0-9]*` and `[0-9]*` tags?
+# Every attempt records its HTTP status and message. No attempt fails the job.
+# No actions are used.
+name: Ruleset probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: Probe tag prefix (tags are <prefix>.1, .2, .4)
+        type: string
+        default: v9.9
+      published_tag:
+        description: Existing tag pushed by a maintainer before the run
+        type: string
+        default: v9.9.3
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      P: ${{ inputs.prefix }}
+      T3: ${{ inputs.published_tag }}
+    steps:
+      - name: Run probes
+        shell: bash
+        run: |
+          set -u
+          api() { # api LABEL METHOD PATH [JSON]
+            local label=$1 method=$2 path=$3 body=${4:-}
+            local args=(-sS -o /tmp/out.json -w '%{http_code}' -X "$method"
+              -H "Authorization: Bearer $GH_TOKEN"
+              -H "Accept: application/vnd.github+json"
+              "https://api.github.com/$path")
+            [ -n "$body" ] && args+=(-d "$body")
+            local code; code=$(curl "${args[@]}")
+            echo "### $label -> HTTP $code"
+            jq -c '{message, errors, status, id, draft, tag_name, immutable, ref, object: .object.sha}' /tmp/out.json 2>/dev/null || cat /tmp/out.json
+            echo "| $label | $code | $(jq -c '.message // "ok"' /tmp/out.json 2>/dev/null) | $(jq -c '.errors // ""' /tmp/out.json 2>/dev/null) |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          tagref() { # print the remote ref of a tag, or "none"
+            local code; code=$(curl -sS -o /tmp/ref.json -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/git/ref/tags/$1")
+            echo "tag $1: HTTP $code $(jq -c '.object.sha // .message' /tmp/ref.json)"
+            echo "| tag $1 exists? | $code | $(jq -c '.object.sha // .message' /tmp/ref.json) | |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          echo "| probe | HTTP | message | errors |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## 2a create tag ref $P.1"
+          api "2a create refs/tags/$P.1" POST "repos/$REPO/git/refs" \
+            "{\"ref\":\"refs/tags/$P.1\",\"sha\":\"$SHA\"}"
+          tagref "$P.1"
+
+          echo "## 2b draft on missing tag $P.2, then publish"
+          api "2b create draft $P.2" POST "repos/$REPO/releases" \
+            "{\"tag_name\":\"$P.2\",\"target_commitish\":\"$SHA\",\"name\":\"probe $P.2\",\"body\":\"ruleset probe\",\"draft\":true}"
+          RID=$(jq -r '.id // empty' /tmp/out.json)
+          tagref "$P.2"
+          if [ -n "$RID" ]; then
+            api "2b publish draft $P.2" PATCH "repos/$REPO/releases/$RID" '{"draft":false}'
+            api "2b release state $P.2" GET "repos/$REPO/releases/$RID"
+          fi
+          tagref "$P.2"
+
+          echo "## 2c draft on maintainer tag $T3, then publish"
+          api "2c create draft $T3" POST "repos/$REPO/releases" \
+            "{\"tag_name\":\"$T3\",\"name\":\"probe $T3\",\"body\":\"ruleset probe\",\"draft\":true}"
+          RID=$(jq -r '.id // empty' /tmp/out.json)
+          if [ -n "$RID" ]; then
+            api "2c publish draft $T3" PATCH "repos/$REPO/releases/$RID" '{"draft":false}'
+            api "2c release state $T3" GET "repos/$REPO/releases/$RID"
+          fi
+          tagref "$T3"
+
+          echo "## 2d update and delete $T3"
+          PARENT=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/commits/$SHA" | jq -r '.parents[0].sha')
+          api "2d move $T3 (force)" PATCH "repos/$REPO/git/refs/tags/$T3" \
+            "{\"sha\":\"$PARENT\",\"force\":true}"
+          api "2d delete $T3" DELETE "repos/$REPO/git/refs/tags/$T3"
+          tagref "$T3"
+
+          echo "## 2e git push $P.4"
+          git init -q probe && cd probe
+          git config http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git remote add origin "https://github.com/$REPO"
+          git fetch -q --depth=1 origin "$SHA"
+          git tag "$P.4" FETCH_HEAD
+          if out=$(git push origin "refs/tags/$P.4" 2>&1); then rc=0; else rc=$?; fi
+          echo "$out"
+          echo "| 2e git push $P.4 | exit $rc | $(echo "$out" | grep -E 'remote: -|rejected|error' | tr '\n' ' ') | |" >> "$GITHUB_STEP_SUMMARY"
+          cd ..
+          tagref "$P.4"
