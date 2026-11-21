@@ -1,0 +1,56 @@
+name: Probe macOS build
+
+# Builds an unsigned sample app and DMG on macOS and runs
+# sandbox/macos/module/ci/macos-collect.sh on them.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build and collect (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: aarch64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Host
+        run: |
+          sw_vers
+          uname -m
+          /bin/bash --version | head -n 1
+          bash --version | head -n 1
+          tar --version
+          command -v SetFile || true
+      - name: Build the unsigned app and DMG
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: /bin/bash sandbox/macos/build.sh "$ARCH" "$RUNNER_TEMP/build"
+      - name: Run macos-collect.sh with /bin/bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          /bin/bash sandbox/macos/module/ci/macos-collect.sh \
+            --app "$RUNNER_TEMP/build/sandboxapp.app" \
+            --dmg "$RUNNER_TEMP/build/sandboxapp_1.2.3_${ARCH}.dmg" \
+            --app-base "sandboxapp_${ARCH}" \
+            --dmg-base "sandboxapp_1.2.3_${ARCH}" \
+            --out "$RUNNER_TEMP/out"
+          ls -la "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: probe-macos-unsigned-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
