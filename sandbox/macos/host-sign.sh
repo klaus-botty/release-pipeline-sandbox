@@ -6,13 +6,16 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 in_dir="$1" wdir="$2"
-team=ZZHOST0003
+host_team=ZZHOST0003
 mkdir -p "$wdir/keys" "$wdir/out"
 echo "bash: $BASH_VERSION"
 
 pw="hp-$(od -A n -t x1 -N 12 /dev/urandom | tr -d ' \n')"
+# No --profile here: on macOS, rcodesign 0.29.0 also reads it as the global
+# configuration profile option and fails ("configuration file error ...
+# problem key: sha256"). The default profile is apple-development.
 rcodesign generate-self-signed-certificate -C /dev/null --person-name "Sandbox Host Signer" \
-	--profile developer-id-application --team-id "$team" --validity-days 2 \
+	--team-id "$host_team" --validity-days 2 \
 	--p12-file "$wdir/keys/host.p12" --p12-password "$pw" --pem-filename "$wdir/keys/host" >/dev/null
 /bin/bash "$here/trust-cert.sh" "$wdir/keys/host.crt"
 
@@ -39,6 +42,6 @@ unset APPLE_P12_BASE64 APPLE_P12_PASSWORD
 
 step "verify-macos.sh"
 /bin/bash "$here/module/verify-macos.sh" --dir "$wdir/out" \
-	--requirement "anchor trusted and certificate leaf[subject.OU] = \"$team\"" \
-	--notarized false --team-id "$team" --bundle-id org.example.sandboxapp --version 1.2.3 \
+	--requirement "anchor trusted and certificate leaf[subject.OU] = \"$host_team\"" \
+	--notarized false --team-id "$host_team" --bundle-id org.example.sandboxapp --version 1.2.3 \
 	--entitlements "$here/app/entitlements.plist" --unsigned-dir "$in_dir"

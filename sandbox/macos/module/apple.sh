@@ -125,6 +125,8 @@ apple_preflight() {
 			--p12-password-file <(_apple_p12_password) 2>&1)" ||
 			die "rcodesign cannot open the certificate in APPLE_P12_BASE64 with APPLE_P12_PASSWORD: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
 		log "    Apple certificate: $(printf '%s\n' "$out" | sed -n 's/^Subject CN: *//p' | head -n 1)"
+		out="$(_apple_team_id)" || die "cannot read the team ID of the certificate in APPLE_P12_BASE64"
+		log "    Apple team ID (subject.OU of the certificate): $out"
 		if [ "$2" = true ]; then
 			[ -n "${APPLE_API_KEY_JSON_BASE64:-}" ] || die "APPLE_API_KEY_JSON_BASE64 is not set (needed for notarization)"
 			_apple_api_key | jq -e '(.issuer_id | strings) and (.key_id | strings) and (.private_key | strings)' >/dev/null 2>&1 ||
@@ -133,6 +135,24 @@ apple_preflight() {
 		;;
 	*) die "usage: apple_preflight tools | apple_preflight secrets <true|false>" ;;
 	esac
+}
+
+# _apple_team_id: prints the team ID of the signing certificate (its
+# subject.OU, which rcodesign reports as "Team ID"). The certificate comes
+# first in the output of analyze-certificate.
+_apple_team_id() {
+	local out team
+	out="$(rcodesign analyze-certificate -C /dev/null --p12-file <(_apple_p12) \
+		--p12-password-file <(_apple_p12_password) 2>&1)" || {
+		log "rcodesign cannot open the certificate: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
+		return 1
+	}
+	team="$(printf '%s\n' "$out" | sed -n 's/^Team ID: *//p' | head -n 1)"
+	[[ "$team" =~ ^[A-Z0-9]{10}$ ]] || {
+		log "the certificate has no team ID of 10 letters and digits in subject.OU: '$team'"
+		return 1
+	}
+	printf '%s\n' "$team"
 }
 
 _apple_check_notarize_arg() {
@@ -548,12 +568,14 @@ $list
 EOF
 }
 
-# _apple_sign_app PARENT APP ENTITLEMENTS: signs the bundle with the
+# _apple_sign_app PARENT APP ENTITLEMENTS TEAM: signs the bundle with the
 # hardened runtime on every Mach-O file and the entitlements on the main
 # executable. Without a path scope, rcodesign sets the runtime flag on the
 # main executable only, so every other Mach-O file gets a scoped flag.
+# rcodesign writes the team ID into the signature by itself only for a
+# certificate that Apple issued, so TEAM (from _apple_team_id) is given.
 _apple_sign_app() {
-	local parent="$1" app="$2" entitlements="$3" machos m args=() info flags
+	local parent="$1" app="$2" entitlements="$3" team="$4" machos m args=() info flags
 	machos="$(_apple_machos "$parent" "$app")" || return 1
 	[ -n "$machos" ] || {
 		log "$app holds no Mach-O file"
@@ -570,7 +592,7 @@ _apple_sign_app() {
 	done <<EOF
 $machos
 EOF
-	_apple_sign "$parent/$app" --code-signature-flags runtime "${args[@]}" \
+	_apple_sign "$parent/$app" --team-name "$team" --code-signature-flags runtime "${args[@]}" \
 		--entitlements-xml-file "$entitlements" || return 1
 	# Check the result: every Mach-O (every slice of a fat file) has a
 	# signature with the runtime flag.
@@ -1049,8 +1071,9 @@ apple_process_arch() (
 	app2="$(_apple_unpack_app "$app_tar" "$work/signed")" || die "$tag the unsigned app archive is not usable"
 	[ "$app" = "$app2" ] || die "$tag ${app_tar##*/} changed while it was read"
 
-	_apple_note "signing $app"
-	_apple_sign_app "$work/signed" "$app" "$entitlements" || die "$tag cannot sign $app"
+	team="$(_apple_team_id)" || die "$tag cannot read the team ID of the certificate"
+	_apple_note "signing $app (team $team)"
+	_apple_sign_app "$work/signed" "$app" "$entitlements" "$team" || die "$tag cannot sign $app"
 
 	if [ "$notarize" = true ]; then
 		_apple_note "notarizing $app (submit, wait, staple)"
