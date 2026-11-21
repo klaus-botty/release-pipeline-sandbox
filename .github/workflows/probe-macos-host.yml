@@ -1,0 +1,62 @@
+name: Probe macOS host
+
+# macOS as the signing host: apple_process_all with /bin/bash (bash 3.2) and
+# hdiutil, then verify-macos.sh. Also shellcheck and /bin/bash -n.
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_ref:
+        description: Branch with the probe data
+        type: string
+        default: probe-macos-data
+
+permissions: {}
+
+env:
+  RCODESIGN_URL: https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
+  RCODESIGN_SHA256: d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d
+
+jobs:
+  host:
+    name: Sign on macOS (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.data_ref }}
+          path: probe-data
+          persist-credentials: false
+      - name: Install rcodesign 0.29.0 (pinned SHA-256)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/rcodesign.tar.gz" "$RCODESIGN_URL"
+          echo "$RCODESIGN_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | shasum -a 256 -c -
+          mkdir "$RUNNER_TEMP/rcodesign"
+          tar -xzf "$RUNNER_TEMP/rcodesign.tar.gz" -C "$RUNNER_TEMP/rcodesign" --strip-components 1
+          echo "$RUNNER_TEMP/rcodesign" >>"$GITHUB_PATH"
+          "$RUNNER_TEMP/rcodesign/rcodesign" --version
+      - name: Syntax check with /bin/bash -n
+        run: |
+          for f in sandbox/macos/module/lib.sh sandbox/macos/module/apple.sh \
+            sandbox/macos/module/verify-macos.sh sandbox/macos/module/ci/macos-collect.sh; do
+            /bin/bash -n "$f" && echo "ok: $f"
+          done
+      - name: shellcheck
+        run: |
+          command -v shellcheck || brew install shellcheck
+          shellcheck --version | head -n 2
+          cd sandbox/macos/module
+          shellcheck -x apple.sh verify-macos.sh ci/macos-collect.sh
+          echo "shellcheck: clean"
+      - name: Sign with apple_process_all, then verify
+        run: /bin/bash sandbox/macos/host-sign.sh "$GITHUB_WORKSPACE/probe-data/unsigned" "$RUNNER_TEMP/host"

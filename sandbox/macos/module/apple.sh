@@ -1070,8 +1070,11 @@ apple_process_arch() (
 	# Decision: the DMG is signed, but not notarized, as in production today.
 	# The app inside it is notarized and stapled (with notarize=true), so
 	# Gatekeeper checks the app when it first runs. No DMG notarization here.
+	# rcodesign takes the identifier of a DMG from the name of the file that
+	# it signs (here "out"), so it is given: the final name without ".dmg".
 	_apple_note "signing the DMG"
-	_apple_sign "$work/out.dmg" || die "$tag cannot sign the DMG"
+	_apple_sign "$work/out.dmg" --binary-identifier "${dmg_file%"$APPLE_UNSIGNED_DMG_SUFFIX"}" ||
+		die "$tag cannot sign the DMG"
 
 	mv "$work/app.tar.gz" "$app_out" || die "cannot write $app_out"
 	mv "$work/out.dmg" "$dmg_out" || die "cannot write $dmg_out"

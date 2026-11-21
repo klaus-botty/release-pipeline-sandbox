@@ -21,15 +21,17 @@
 #     signed app; the file trees are also compared
 #   - codesign --verify --deep --strict passes with REQUIREMENT (nested code
 #     and the sealed contents)
-#   - team identifier, bundle identifier (signature and Info.plist), and
-#     CFBundleShortVersionString are the expected values
+#   - team identifier (signature and subject.OU of the certificate), bundle
+#     identifier (signature and Info.plist), and CFBundleShortVersionString
+#     are the expected values
 #   - the main executable is a single-architecture Mach-O file for the
 #     architecture of the asset name
 #   - the entitlements of the main executable equal PLIST (parsed values)
 #   - every Mach-O file has the hardened runtime flag
 #   - with --notarized true: the stapled ticket validates, and Gatekeeper
 #     (spctl) accepts the app
-# For each DMG: hdiutil verify, and a valid signature that meets REQUIREMENT.
+# For each DMG: hdiutil verify, and a valid signature that meets REQUIREMENT,
+# by a certificate with TEAMID in subject.OU.
 # The DMG is signed, but not notarized (decision, as in production today):
 # the app inside carries the notarization ticket.
 #
@@ -115,6 +117,15 @@ signature_field() {
 	printf '%s\n' "$values"
 }
 
+# check_certificate_team PATH LABEL: the leaf certificate of the signature of
+# PATH has the team identifier in subject.OU, as an Apple Developer ID
+# certificate has. This does not depend on the --requirement text.
+check_certificate_team() {
+	local out
+	out="$(codesign --verify --strict "-R=certificate leaf[subject.OU] = \"$team_id\"" "$1" 2>&1)" ||
+		die "$2: the signing certificate is not for team '$team_id' (subject.OU): $out"
+}
+
 # plist_value APP KEY: a string value of Contents/Info.plist.
 plist_value() {
 	plutil -extract "$2" raw -o - "$1/Contents/Info.plist"
@@ -134,6 +145,7 @@ check_app() {
 	CDHASH="$(signature_field "$info" CDHash)" || die "$label: no single CDHash in the signature"
 	value="$(signature_field "$info" TeamIdentifier)" || die "$label: no single TeamIdentifier in the signature"
 	[ "$value" = "$team_id" ] || die "$label: the team identifier is '$value', expected '$team_id'"
+	check_certificate_team "$app" "$label"
 	value="$(signature_field "$info" Identifier)" || die "$label: no single Identifier in the signature"
 	[ "$value" = "$bundle_id" ] || die "$label: the signing identifier is '$value', expected '$bundle_id'"
 	value="$(plist_value "$app" CFBundleIdentifier)" || die "$label: Info.plist has no CFBundleIdentifier"
@@ -290,9 +302,14 @@ while IFS=' ' read -r key tgz dmg; do
 	out="$(codesign --verify --strict "-R=$requirement" "$dir/$dmg" 2>&1)" ||
 		die "$dmg: codesign --verify with the requirement fails: $out"
 	info="$(codesign -d --verbose=2 "$dir/$dmg" 2>&1)" || die "$dmg: codesign cannot read the signature: $info"
+	# rcodesign writes a version 0x20100 code directory for a DMG, which has
+	# no team field: codesign shows "TeamIdentifier=not set". The team is
+	# checked on the certificate instead.
 	value="$(signature_field "$info" TeamIdentifier)" || die "$dmg: no single TeamIdentifier in the signature"
-	[ "$value" = "$team_id" ] || die "$dmg: the team identifier is '$value', expected '$team_id'"
-	log "    $dmg: hdiutil verify, signature, requirement, team: ok (not notarized, by decision)"
+	[ "$value" = "$team_id" ] || [ "$value" = "not set" ] ||
+		die "$dmg: the team identifier is '$value', expected '$team_id'"
+	check_certificate_team "$dir/$dmg" "$dmg"
+	log "    $dmg: hdiutil verify, signature, requirement, team of the certificate: ok (not notarized, by decision)"
 
 	mnt="$work/mnt-$key"
 	mkdir "$mnt"

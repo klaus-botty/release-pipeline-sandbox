@@ -153,7 +153,74 @@ if type != "object" then "the configuration is not a JSON object" else
 	 elif (.updater | type) != "object" then "updater must be an object, because some products have updater platforms"
 	 else .updater | (["pubkey_file", "pubkey_jq", "version_file", "version_jq"][] as $k |
 		if (.[$k] | nonempty_string) then empty else "updater.\($k) must be a nonempty string" end)
-	 end)
+	 end),
+	([.products[]? | objects | select(.name | nonempty_string)] as $p |
+	 def names($o): [$p[] | select(.origin == $o) | .name];
+	 def one_line: nonempty_string and (test("[\\n\\r]") | not);
+	 def repo_path: nonempty_string and test("^[A-Za-z0-9_][A-Za-z0-9._/-]*$") and
+		(("/" + . + "/") | test("/\\.\\.?/|//") | not);
+	 def keys_exactly($s; $req; $opt):
+		((keys - $req - $opt)[] | "\($s) has an unknown key: \(.)"),
+		(($req - keys)[] | "\($s).\(.) is missing");
+	 def product_of($s; $k; $origins):
+		if (.[$k] | nonempty_string) | not then "\($s).\($k) must be a nonempty string"
+		elif [$origins[] as $o | names($o)[]] | index(.[$k]) then empty
+		else "\($s).\($k) is \(.[$k]), which is not a product with the origin \($origins | join(" or ")) in products" end;
+	 (if has("apple") | not then empty
+	  elif (.apple | type) != "object" then "apple must be an object"
+	  else .apple | (
+		keys_exactly("apple"; ["entitlements_file", "notarize", "requirement", "team_id", "bundle_id"]; []),
+		(if has("entitlements_file") and (.entitlements_file | repo_path | not) then "apple.entitlements_file must be a plain relative path in the repository" else empty end),
+		(if has("notarize") and (.notarize | type) != "boolean" then "apple.notarize must be true or false" else empty end),
+		(if has("requirement") and (.requirement | one_line | not) then "apple.requirement must be a nonempty string on one line" else empty end),
+		(if has("team_id") and ((.team_id | type) != "string" or (.team_id | test("^[A-Z0-9]{10}$") | not)) then "apple.team_id must be a team identifier (10 capital letters or digits)" else empty end),
+		(if has("bundle_id") and ((.bundle_id | type) != "string" or (.bundle_id | test("^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$") | not)) then "apple.bundle_id must be a bundle identifier (reverse DNS)" else empty end),
+		(names("input") as $in | names("local") as $loc |
+		 ([$in[] | select(endswith(".app.unsigned.tar"))] | if length == 0 then "apple: products holds no input product <base>.app.unsigned.tar" else empty end),
+		 ($in[] | select(endswith(".app.unsigned.tar")) | (.[:-17] + ".app.tar.gz") as $want |
+			if $loc | index($want) then empty else "apple: the input product \(.) needs the local product \($want)" end),
+		 ($in[] | select(endswith(".unsigned.dmg")) | (.[:-13] + ".dmg") as $want |
+			if $loc | index($want) then empty else "apple: the input product \(.) needs the local product \($want)" end))
+	  ) end),
+	 (if has("flatpak") | not then empty
+	  elif (.flatpak | type) != "object" then "flatpak must be an object"
+	  else .flatpak | (
+		keys_exactly("flatpak"; ["app_id", "arch", "branch", "fingerprint", "bundle_name", "templates_dir", "url", "homepage", "to_sign", "repo_tar", "signatures"]; ["extra_refs"]),
+		(if has("app_id") and ((.app_id | type) != "string" or (.app_id | test("^[A-Za-z_][A-Za-z0-9_-]*(\\.[A-Za-z_][A-Za-z0-9_-]*)+$") | not)) then "flatpak.app_id is not a Flatpak application id" else empty end),
+		(if has("arch") and ((.arch | type) != "string" or (.arch | test("^[A-Za-z0-9_]+$") | not)) then "flatpak.arch is not a Flatpak architecture" else empty end),
+		(if has("branch") and ((.branch | type) != "string" or (.branch | test("^[A-Za-z0-9_][A-Za-z0-9._-]*$") | not)) then "flatpak.branch is not a Flatpak branch name" else empty end),
+		(if has("fingerprint") and ((.fingerprint | type) != "string" or (.fingerprint | test("^([0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$") | not)) then "flatpak.fingerprint must be a full key fingerprint (40 or 64 hex digits, no spaces)" else empty end),
+		(if has("bundle_name") and (.bundle_name | nonempty_string | not) then "flatpak.bundle_name must be a nonempty string" else empty end),
+		(if has("templates_dir") and (.templates_dir | repo_path | not) then "flatpak.templates_dir must be a plain relative path in the repository" else empty end),
+		(["url", "homepage"][] as $k | if has($k) and ((.[$k] | one_line | not) or (.[$k] | test("^https://[^\\s|&\\\\]+$") | not)) then "flatpak.\($k) must be an https URL without white space, |, &, or \\" else empty end),
+		(if has("to_sign") then product_of("flatpak"; "to_sign"; ["input"]) else empty end),
+		(if has("repo_tar") then product_of("flatpak"; "repo_tar"; ["ci"]) else empty end),
+		(if has("signatures") then product_of("flatpak"; "signatures"; ["local"]) else empty end),
+		(if has("extra_refs") | not then empty
+		 elif (.extra_refs | type) != "array" or (.extra_refs | any(type != "string")) then "flatpak.extra_refs must be a list of ref names"
+		 else
+			(.extra_refs[] | select((test("^(app|runtime)/[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_]+/[A-Za-z0-9_][A-Za-z0-9_.-]*$") or test("^appstream2?/[A-Za-z0-9_]+$")) and (test("\\.\\.") | not) | not) |
+				"flatpak.extra_refs: not a Flatpak ref name: \(.)"),
+			(.extra_refs | group_by(.)[] | select(length > 1) | "flatpak.extra_refs lists \(.[0]) more than once"),
+			(. as $f | ["app/\($f.app_id)/\($f.arch)/\($f.branch)", "runtime/\($f.app_id).Debug/\($f.arch)/\($f.branch)", "appstream/\($f.arch)", "appstream2/\($f.arch)"] as $conv |
+				$f.extra_refs[] | select(. as $r | $conv | index($r)) |
+				"flatpak.extra_refs lists \(.), which every release holds already. List only the refs beyond app/<app_id>/<arch>/<branch>, runtime/<app_id>.Debug/<arch>/<branch>, appstream/<arch>, and appstream2/<arch>.")
+		 end)
+	  ) end),
+	 (if has("homebrew") | not then empty
+	  elif (.homebrew | type) != "object" then "homebrew must be an object"
+	  else .homebrew | (
+		keys_exactly("homebrew"; ["template_file", "output", "dmg"]; []),
+		(if has("template_file") and (.template_file | repo_path | not) then "homebrew.template_file must be a plain relative path in the repository" else empty end),
+		(if has("output") then product_of("homebrew"; "output"; ["local"]) else empty end),
+		(if has("dmg") | not then empty
+		 elif (.dmg | type) != "object" or (.dmg | length) == 0 then "homebrew.dmg must be a nonempty object: {\"<arch>\": \"<product name>\"}"
+		 else .dmg | to_entries[] |
+			(if .key | test("^[a-z0-9_]+$") then empty else "homebrew.dmg: the architecture \(.key) must use only a-z, 0-9, and _" end),
+			(if (.value | nonempty_string) and (names("local") + names("build") | index(.value)) then empty
+			 else "homebrew.dmg.\(.key) is \(.value), which is not a product with the origin local or build in products" end)
+		 end)
+	  ) end))
 end'
 
 # validate_config: checks the whole configuration once, and sets CFG_PRODUCTS
