@@ -5,6 +5,10 @@ of a version into its draft release.
 
 ## [Unreleased]
 
+## [0.8.6] - test
+
+- Negative test release 0.8.6.
+
 ## [0.8.5] - test
 
 - Negative test release 0.8.5.
