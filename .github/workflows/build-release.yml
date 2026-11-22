@@ -171,18 +171,15 @@ jobs:
 
       # build-manifest.sh needs both groups of dev-scripts/release/config.json:
       # artifact_pattern (release-*, what the signer downloads) and
-      # ci_artifact_pattern (ci-*, flatpak-repo.tar). Each artifact goes into
-      # its own subdirectory of artifacts/.
-      - name: Download the release artifacts
+      # ci_artifact_pattern (ci-*, flatpak-repo.tar), each artifact in its own
+      # subdirectory of artifacts/. One download of all artifacts of the run:
+      # download-artifact extracts a pattern that matches only one artifact
+      # (ci-* matches only ci-gui-flatpak-repo) directly into the path,
+      # without the subdirectory. build-manifest.sh refuses an artifact that
+      # matches neither pattern.
+      - name: Download the build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: release-*
-          path: artifacts
-
-      - name: Download the CI artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: ci-*
           path: artifacts
 
       - name: Build the manifest
