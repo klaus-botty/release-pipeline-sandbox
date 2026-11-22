@@ -14,8 +14,8 @@ on:
 permissions: {}
 
 env:
-  RCODESIGN_URL: https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
-  RCODESIGN_SHA256: d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d
+  RCS_URL: https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
+  RCS_SHA256: d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d
 
 jobs:
   host:
@@ -39,8 +39,8 @@ jobs:
       - name: Install rcodesign 0.29.0 (pinned SHA-256)
         run: |
           set -euo pipefail
-          curl -sSfL -o "$RUNNER_TEMP/rcodesign.tar.gz" "$RCODESIGN_URL"
-          echo "$RCODESIGN_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | shasum -a 256 -c -
+          curl -sSfL -o "$RUNNER_TEMP/rcodesign.tar.gz" "$RCS_URL"
+          echo "$RCS_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | shasum -a 256 -c -
           mkdir "$RUNNER_TEMP/rcodesign"
           tar -xzf "$RUNNER_TEMP/rcodesign.tar.gz" -C "$RUNNER_TEMP/rcodesign" --strip-components 1
           echo "$RUNNER_TEMP/rcodesign" >>"$GITHUB_PATH"
@@ -59,4 +59,8 @@ jobs:
           shellcheck -x apple.sh verify-macos.sh ci/macos-collect.sh
           echo "shellcheck: clean"
       - name: Sign with apple_process_all, then verify
+        env:
+          # rcodesign reads every RCODESIGN_* variable as configuration.
+          # apple.sh must drop them; this unknown key would break every call.
+          RCODESIGN_PROBE_UNKNOWN_KEY: "1"
         run: /bin/bash sandbox/macos/host-sign.sh "$GITHUB_WORKSPACE/probe-data/unsigned" "$RUNNER_TEMP/host"

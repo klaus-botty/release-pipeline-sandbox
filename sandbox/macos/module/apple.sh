@@ -78,6 +78,26 @@ _apple_p12_password() { printf '%s' "$APPLE_P12_PASSWORD"; }
 _apple_api_key() { printf '%s' "$APPLE_API_KEY_JSON_BASE64" | base64 --decode; }
 
 # ---------------------------------------------------------------------------
+# rcodesign
+# ---------------------------------------------------------------------------
+
+# _apple_rcodesign ARG...: runs rcodesign without the environment variables
+# that start with RCODESIGN_. rcodesign reads each of them as a configuration
+# setting (RCODESIGN_<KEY>), even with "-C /dev/null", so an unrelated
+# variable can change or break the signing: RCODESIGN_SHA256 in a CI job made
+# every call fail with "problem key: sha256". Every rcodesign call goes
+# through this function.
+_apple_rcodesign() {
+	local v drop=()
+	for v in $(compgen -e); do
+		case "$v" in
+		RCODESIGN_*) drop+=(-u "$v") ;;
+		esac
+	done
+	env ${drop[@]+"${drop[@]}"} rcodesign "$@"
+}
+
+# ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
 
@@ -121,7 +141,7 @@ apple_preflight() {
 		_apple_check_notarize_arg "${2:-}"
 		[ -n "${APPLE_P12_BASE64:-}" ] || die "APPLE_P12_BASE64 is not set"
 		[ -n "${APPLE_P12_PASSWORD+set}" ] || die "APPLE_P12_PASSWORD is not set"
-		out="$(rcodesign analyze-certificate -C /dev/null --p12-file <(_apple_p12) \
+		out="$(_apple_rcodesign analyze-certificate -C /dev/null --p12-file <(_apple_p12) \
 			--p12-password-file <(_apple_p12_password) 2>&1)" ||
 			die "rcodesign cannot open the certificate in APPLE_P12_BASE64 with APPLE_P12_PASSWORD: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
 		log "    Apple certificate: $(printf '%s\n' "$out" | sed -n 's/^Subject CN: *//p' | head -n 1)"
@@ -142,7 +162,7 @@ apple_preflight() {
 # first in the output of analyze-certificate.
 _apple_team_id() {
 	local out team
-	out="$(rcodesign analyze-certificate -C /dev/null --p12-file <(_apple_p12) \
+	out="$(_apple_rcodesign analyze-certificate -C /dev/null --p12-file <(_apple_p12) \
 		--p12-password-file <(_apple_p12_password) 2>&1)" || {
 		log "rcodesign cannot open the certificate: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
 		return 1
@@ -550,7 +570,7 @@ _apple_sign() {
 	while IFS= read -r line; do
 		[ -n "$line" ] && ts+=("$line")
 	done < <(_apple_timestamp_args)
-	rcodesign sign -C /dev/null --p12-file <(_apple_p12) --p12-password-file <(_apple_p12_password) \
+	_apple_rcodesign sign -C /dev/null --p12-file <(_apple_p12) --p12-password-file <(_apple_p12_password) \
 		${ts[@]+"${ts[@]}"} "$@" "$path"
 }
 
@@ -597,7 +617,7 @@ EOF
 	# Check the result: every Mach-O (every slice of a fat file) has a
 	# signature with the runtime flag.
 	while IFS= read -r m; do
-		info="$(rcodesign print-signature-info "$parent/$app/$m" 2>&1)" || {
+		info="$(_apple_rcodesign print-signature-info -C /dev/null "$parent/$app/$m" 2>&1)" || {
 			log "rcodesign cannot read the signature of $app/$m: $info"
 			return 1
 		}
@@ -1077,7 +1097,7 @@ apple_process_arch() (
 
 	if [ "$notarize" = true ]; then
 		_apple_note "notarizing $app (submit, wait, staple)"
-		rcodesign notary-submit -C /dev/null --api-key-file <(_apple_api_key) --wait --staple "$work/signed/$app" ||
+		_apple_rcodesign notary-submit -C /dev/null --api-key-file <(_apple_api_key) --wait --staple "$work/signed/$app" ||
 			die "$tag notarization of $app failed"
 	fi
 
