@@ -1,0 +1,11 @@
+[Flatpak Repo]
+Url=https://klaus-botty.github.io/release-pipeline-sandbox
+Icon=https://klaus-botty.github.io/release-pipeline-sandbox/icon.png
+SuggestRemoteName=sandbox
+Homepage=https://github.com/klaus-botty/release-pipeline-sandbox
+GPGKey=mDMEawB8/hYJKwYBBAHaRw8BAQdAxP2EqAM2Tw9dy7X8gfbSq49vPQq6iV0KeSWK9BYnhS60J1NhbmRib3ggU2lnbmVyIDxzaWduZXJAZXhhbXBsZS5pbnZhbGlkPoiQBBMWCgA4FiEE1D6O72hZ77+hh7qfAaBhv/7h/f8FAmsAfP4CGwMFCwkIBwIGFQoJCAsCBBYCAwECHgECF4AACgkQAaBhv/7h/f/03gD+MT4fNM/UThiRvymcZVjNtWRR0fGCSRLpj1pkg4ee1fABAIVKdN1DFZW+uleSRcJ3HWXsX0SGAesSeL2AFIT2vdYJuDgEawB8/xIKKwYBBAGXVQEFAQEHQL8WoodXXu6qMpxhdJ9ksm1tHIqDBN+SNIalJwEQI3ZBAwEIB4h4BBgWCgAgFiEE1D6O72hZ77+hh7qfAaBhv/7h/f8FAmsAfP8CGwwACgkQAaBhv/7h/f8PrAEAwxyMaJdgldO3TVru5mL6r/zMg6hsxNDytYbxPynu814A/RIvOsMD6Dx17vV9nXg+fqMoFpZUb/DkeWKvk8hTzuMB
+
+Title=Sandbox
+Name=sandbox
+Comment=Dummy repository for release pipeline probes
+Description=Dummy Flatpak repository for release pipeline probes
