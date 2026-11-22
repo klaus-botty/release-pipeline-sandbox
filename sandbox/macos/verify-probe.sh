@@ -48,10 +48,11 @@ negative() { # NAME PATTERN DIR TEAM
 	fi
 	printf -- '- %s: rc=%s: %s\n' "$name" "$rc" "$msg" >>"$summary"
 }
-negative wrong-team-id "the team identifier is" "$data/signed" ZZWRONG999
+negative wrong-team-id "is not for team .ZZWRONG999." "$data/signed" ZZWRONG999
 negative other-team "requirement fails" "$data/neg/other-team" "$team"
 negative unsigned-dmg "requirement fails" "$data/neg/unsigned-dmg" "$team"
 negative separate-signing "different code directory hashes" "$data/neg/separate-signing" "$team"
+negative separate-resign "hold different apps" "$data/neg/separate-resign" "$team"
 negative wrong-bundle-id "signing identifier is" "$data/neg/wrong-bundle-id" "$team"
 negative wrong-version "CFBundleShortVersionString is" "$data/neg/wrong-version" "$team"
 negative other-entitlements "entitlements differ" "$data/neg/other-entitlements" "$team"

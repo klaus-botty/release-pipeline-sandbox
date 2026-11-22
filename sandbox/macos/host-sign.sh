@@ -11,12 +11,33 @@ mkdir -p "$wdir/keys" "$wdir/out"
 echo "bash: $BASH_VERSION"
 
 pw="hp-$(od -A n -t x1 -N 12 /dev/urandom | tr -d ' \n')"
-# No --profile here: on macOS, rcodesign 0.29.0 also reads it as the global
-# configuration profile option and fails ("configuration file error ...
-# problem key: sha256"). The default profile is apple-development.
-rcodesign generate-self-signed-certificate -C /dev/null --person-name "Sandbox Host Signer" \
-	--team-id "$host_team" --validity-days 2 \
-	--p12-file "$wdir/keys/host.p12" --p12-password "$pw" --pem-filename "$wdir/keys/host" >/dev/null
+# The certificate comes from /usr/bin/openssl (LibreSSL), not from rcodesign:
+# on macOS, rcodesign 0.29.0 generate-self-signed-certificate always fails
+# with "configuration file error ... problem key: sha256", because its
+# --profile option (default apple-development) is also read as the global
+# configuration profile. The certificate has the fields of a Developer ID
+# Application certificate: team ID in subject.OU, code signing EKU, and the
+# Developer ID extension 1.2.840.113635.100.6.1.13.
+cat >"$wdir/keys/cert.cnf" <<CNF
+[req]
+distinguished_name = dn
+prompt = no
+x509_extensions = ext
+[dn]
+CN = Developer ID Application: Sandbox Host Signer ($host_team)
+OU = $host_team
+O = Sandbox Host Signer
+C = XX
+[ext]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+1.2.840.113635.100.6.1.13 = critical,DER:05:00
+CNF
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 2 -config "$wdir/keys/cert.cnf" \
+	-keyout "$wdir/keys/host.key" -out "$wdir/keys/host.crt"
+/usr/bin/openssl pkcs12 -export -inkey "$wdir/keys/host.key" -in "$wdir/keys/host.crt" \
+	-out "$wdir/keys/host.p12" -passout "fd:3" 3<<<"$pw"
 /bin/bash "$here/trust-cert.sh" "$wdir/keys/host.crt"
 
 # shellcheck source-path=SCRIPTDIR source=module/lib.sh
