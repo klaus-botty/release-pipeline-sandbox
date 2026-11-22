@@ -5,6 +5,10 @@ of a version into its draft release.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-22
+
+- Release B: a second release through the same pipeline.
+
 ## [0.7.1] - 2026-11-22
 
 - Release A of the integrated three-step pipeline in this sandbox.
