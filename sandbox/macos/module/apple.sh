@@ -1001,7 +1001,7 @@ _apple_dmg_linux() {
 }
 
 # ---------------------------------------------------------------------------
-# DMG rebuild on macOS, with hdiutil. UNTESTED: no macOS host was available.
+# DMG rebuild on macOS, with hdiutil. Tested on GitHub macOS 15 runners.
 #
 # No sandbox here: hdiutil and the kernel handle the image natively. Mounting
 # the DMG from CI carries the same exposure as opening any downloaded DMG on

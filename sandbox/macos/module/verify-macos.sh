@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Step 3 check of the signed Apple files: the gate before publishing. Runs on
-# a macOS runner with no secrets. UNTESTED: written without access to a
-# macOS host. Needs macOS 12 or later (plutil -extract raw, codesign --xml).
+# a macOS runner with no secrets. Tested on GitHub macOS 15 runners (arm64
+# and x64) with /bin/bash 3.2. Needs macOS 12 or later (plutil -extract raw,
+# codesign --xml).
 #
 # Usage: verify-macos.sh --dir DIR --requirement REQUIREMENT --notarized true|false
 #                        --team-id TEAMID --bundle-id ID --version VERSION

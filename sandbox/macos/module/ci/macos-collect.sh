@@ -3,7 +3,7 @@
 # the Apple signing step (dev-scripts/release/apple.sh):
 #   <app-base>.app.unsigned.tar   the .app directory at the top level
 #   <dmg-base>.unsigned.dmg       a copy of the DMG
-# UNTESTED: written without access to a macOS host.
+# Tested on GitHub macOS 15 runners (arm64 and x64) with /bin/bash 3.2.
 #
 # Usage: macos-collect.sh --app PATH/X.app --dmg PATH/FILE.dmg --app-base BASE
 #                         --dmg-base BASE --out DIR
