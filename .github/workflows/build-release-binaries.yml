@@ -1,0 +1,126 @@
+# Sandbox stand-in for the command line build. It holds no secret and writes
+# nothing.
+#
+# The matrix hosts, the pack step, and the artifact names are the same as in
+# the real workflow. The build step writes a small stand-in program instead of
+# "cargo build", and there are two programs (tool, helper) instead of five.
+#
+# workflow_call (from build-release.yml): upload each archive as the workflow
+# artifact release-cli-<bin>-<target>.
+name: "Build tool and helper release binaries"
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag. It goes into the archive names. The caller validates it.
+        type: string
+        required: true
+      ref:
+        description: Commit to check out. Empty means the commit of the run.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-cli-release-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build_binaries:
+    name: Build
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - target: x86_64-unknown-linux-gnu
+            host: ubuntu-22.04
+            archive_extension: tar
+            ext: ""
+          - target: aarch64-apple-darwin
+            host: macos-15
+            archive_extension: tar
+            ext: ""
+          - target: x86_64-apple-darwin
+            host: macos-15-intel
+            archive_extension: tar
+            ext: ""
+          - target: x86_64-pc-windows-gnu
+            host: ubuntu-22.04
+            archive_extension: zip
+            ext: ".exe"
+
+        bin:
+          - name: tool
+          - name: helper
+
+    runs-on: ${{ matrix.target.host }}
+
+    env:
+      TAG: ${{ inputs.tag }}
+      BIN: ${{ matrix.bin.name }}
+      TARGET: ${{ matrix.target.target }}
+      EXT: ${{ matrix.target.ext }}
+      ARCHIVE_EXTENSION: ${{ matrix.target.archive_extension }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Build ${{ matrix.bin.name }} (stand-in)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "target/$TARGET/release"
+          printf '#!/bin/sh\necho "%s %s for %s (stand-in)"\n' "$BIN" "$TAG" "$TARGET" >"target/$TARGET/release/$BIN$EXT"
+          head -c 65536 /dev/urandom >>"target/$TARGET/release/$BIN$EXT"
+          chmod +x "target/$TARGET/release/$BIN$EXT"
+
+          echo "BIN_PATH=target/$TARGET/release/$BIN$EXT" >> "$GITHUB_ENV"
+
+      - name: Pack the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          arch="${TARGET%%-*}"
+          target_os="$(cut -d- -f3 <<<"$TARGET")"
+          case "$target_os" in
+          linux) system=Linux ;;
+          windows) system=Windows ;;
+          darwin) system=Darwin ;;
+          *)
+            echo "::error::Unknown target OS: $target_os"
+            exit 1
+            ;;
+          esac
+
+          # dev-scripts/release/config.json names the archives
+          # <bin>_{version}_<system>_<arch>, where version is the tag without
+          # a leading "v" (set_release_version in dev-scripts/release/lib.sh).
+          archive="${BIN}_${TAG#v}_${system}_${arch}.${ARCHIVE_EXTENSION}"
+          mkdir dist
+          case "$ARCHIVE_EXTENSION" in
+          tar) tar -cf "dist/$archive" -C "$(dirname "$BIN_PATH")" "$(basename "$BIN_PATH")" ;;
+          zip) zip "dist/$archive" -j "$BIN_PATH" ;;
+          *)
+            echo "::error::Unknown archive type: $ARCHIVE_EXTENSION"
+            exit 1
+            ;;
+          esac
+          ls -l dist
+
+      - name: Upload the archive as a release artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-cli-${{ matrix.bin.name }}-${{ matrix.target.target }}
+          path: dist/
+          if-no-files-found: error

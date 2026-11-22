@@ -1,7 +1,48 @@
-# This workflow uses no actions (no `uses:` anywhere). Its jobs hold write
-# tokens and publish credentials, so they run only tools of the runner image
-# and scripts of this repository. Each job fetches the scripts as a tarball
-# of the commit of this run instead of using actions/checkout.
+# Step 3 of the release pipeline: verify the signed draft release, then
+# publish it. Sandbox copy of the real finalize workflow.
+#
+# The signing script (`just sign-release <tag>`) starts this workflow with the
+# inputs tag and build_run_id. dev-scripts/release/config.json names this file
+# (finalize_workflow).
+#
+# Phase A changes nothing that users can see:
+#   verify             finalize-release.sh stage: verifies the signatures and
+#                      completes the draft with the unchanged build files.
+#                      Hands the verified file set to the later jobs as the
+#                      workflow artifact verified-release, and its manifest
+#                      hash as the job output manifest_sha256.
+#   verify-macos       Apple tools check the signed app and the DMG files.
+#                      No secret.
+#   flatpak-prepare    builds the signed Flatpak repository for gh-pages.
+#   store-upload       stand-in for the upload to an update store: checks the
+#                      verified set and plans the upload. It waits for the
+#                      three checks above. It sends nothing anywhere.
+# Phase B runs only if all of phase A passed:
+#   publish-flatpak    pushes the Flatpak repository to gh-pages.
+#   publish-github     verifies the draft again and publishes it on the git
+#                      tag that the signing script pushed with the login of
+#                      the maintainer. It runs only after every other job
+#                      passed, so the publication is the last action. No
+#                      workflow creates a release tag: a tag ruleset protects
+#                      them.
+#
+# Rules:
+# - Every job that uses a file of the release first downloads verified-release
+#   and checks it with finalize-release.sh check-set against the manifest hash
+#   that verify pinned.
+# - Repository write access only in verify, publish-github, and
+#   publish-flatpak. These jobs hold no other credential and run no
+#   third-party code: only first-party actions/* actions, tools of the runner
+#   image, and scripts of this repository.
+# - Every job that holds a write permission runs in the environment release.
+# - One run per tag at a time, and one run per channel at a time across tags.
+#   No channel moves back to an older version.
+# - No input reaches a shell through an expression: inputs go through env.
+# - Each job checks the state first, so a re-run after a failure continues.
+#   A re-run of all jobs after publish-github re-verifies the published
+#   release instead of staging it.
+# - Each job writes one line to the job summary: what it did, the tag, and
+#   the manifest hash it used.
 name: Finalize release
 run-name: Finalize release ${{ inputs.tag }}
 
@@ -17,7 +58,8 @@ on:
         type: string
         required: true
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: finalize-release-${{ inputs.tag }}
@@ -27,11 +69,17 @@ jobs:
   verify:
     name: Verify the signed draft release
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
-      contents: write # read the draft release and add files to it
-      actions: read # read the artifacts of the build run
+      contents: write # read the draft release and add files to it (GitHub shows drafts only to writers)
+      actions: read # read the build run and its artifacts
     outputs:
-      manifest_sha256: ${{ steps.stage.outputs.manifest_sha256 }}
+      manifest_sha256: ${{ steps.result.outputs.manifest_sha256 }}
+      version: ${{ steps.state.outputs.version }}
+      published: ${{ steps.state.outputs.published }}
+      store: ${{ steps.state.outputs.store }}
+      flatpak: ${{ steps.state.outputs.flatpak }}
+      docker: ${{ steps.state.outputs.docker }}
     steps:
       - name: Fetch the pipeline scripts at the commit of this run
         env:
@@ -45,24 +93,118 @@ jobs:
           set -euo pipefail
           sudo apt-get update -q && sudo apt-get install -y -q minisign
 
-      - name: Verify and stage the release
-        id: stage
+      - name: Check the inputs and the state of the release
+        id: state
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
           set -euo pipefail
-          repo/dev-scripts/release/finalize-release.sh stage --tag "$TAG" --run-id "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --repo-root repo
+          # shellcheck source=/dev/null
+          . repo/dev-scripts/release/lib.sh
+          valid_tag "$TAG" || die "tag is not valid: $TAG"
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]] || die "build run id is not a number: $BUILD_RUN_ID"
+          set_release_version "$TAG"
+          release="$(find_release "$GITHUB_REPOSITORY" "$TAG")"
+          draft="$(jq -r .draft <<<"$release")"
+          case "$draft" in
+          true) published=false ;;
+          false) published=true ;;
+          *) die "cannot read the draft state of release $TAG" ;;
+          esac
 
-  publish-targets:
-    # Stand-in for jobs that publish the verified files to other targets.
-    name: Publish to other targets
+          # The old release workflows published previews and developer test
+          # releases to fewer channels. Keep these rules.
+          store=true flatpak=true docker=true
+          case "$TAG" in
+          *preview*) store=false flatpak=false ;;
+          test-*) store=false flatpak=false docker=false ;;
+          esac
+          {
+            echo "version=$RELEASE_VERSION"
+            echo "published=$published"
+            echo "store=$store"
+            echo "flatpak=$flatpak"
+            echo "docker=$docker"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Verify and stage the draft release
+        id: stage
+        if: steps.state.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          repo/dev-scripts/release/finalize-release.sh stage --tag "$TAG" --run-id "$BUILD_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" --repo-root repo --out "$RUNNER_TEMP/verified"
+
+      # A re-run after publish-github: stage refuses a published release. A
+      # published release cannot change, so verify it as it is, and let the
+      # later jobs continue with it.
+      - name: Verify the published release
+        id: published
+        if: steps.state.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . repo/dev-scripts/release/lib.sh
+          export REPO_ROOT="$PWD/repo"
+          load_config
+          branch="${CFG_RELEASE_BRANCH:-$(default_branch "$GITHUB_REPOSITORY")}"
+          [ "$GITHUB_REF" = "refs/heads/$branch" ] ||
+            die "this workflow runs on $GITHUB_REF. Start it from the branch $branch."
+          echo "::notice title=Already published::Release $TAG is published already. This run verifies it and continues with the other channels."
+          release="$(find_release "$GITHUB_REPOSITORY" "$TAG")"
+          commit="$(jq -r .target_commitish <<<"$release")"
+          valid_commit "$commit" || die "the release targets '$commit', not a full commit SHA"
+          [ "$(tag_commit "$GITHUB_REPOSITORY" "$TAG")" = "$commit" ] ||
+            die "git tag $TAG does not point to the release commit $commit"
+          require_build_run "$GITHUB_REPOSITORY" "$BUILD_RUN_ID" "$commit"
+          download_release_assets "$GITHUB_REPOSITORY" "$release" "$RUNNER_TEMP/verified"
+          repo/dev-scripts/release/verify-release.sh --dir "$RUNNER_TEMP/verified" --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG" --commit "$commit" --run-id "$BUILD_RUN_ID" --repo-root repo
+          echo "manifest_sha256=$(sha256_of "$RUNNER_TEMP/verified/$MANIFEST_NAME")" >>"$GITHUB_OUTPUT"
+
+      - name: Record the verified manifest
+        id: result
+        env:
+          TAG: ${{ inputs.tag }}
+          STAGED: ${{ steps.stage.outputs.manifest_sha256 }}
+          PUBLISHED: ${{ steps.published.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          hash="${STAGED:-$PUBLISHED}"
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::No verified manifest hash."; exit 1; }
+          # The set must pass the same check that every later job runs.
+          repo/dev-scripts/release/finalize-release.sh check-set --dir "$RUNNER_TEMP/verified" \
+            --manifest-sha256 "$hash" --repo-root repo
+          echo "manifest_sha256=$hash" | tee -a "$GITHUB_OUTPUT"
+          echo "verify: $TAG verified, manifest sha256 $hash" >>"$GITHUB_STEP_SUMMARY"
+
+      # The artifact belongs to this run and cannot be changed by the
+      # later jobs. They check it against manifest_sha256 before any use. A
+      # re-run of this job replaces it with a set of the same manifest.
+      - name: Hand the verified files to the later jobs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verified-release
+          path: ${{ runner.temp }}/verified/
+          if-no-files-found: error
+          overwrite: true
+
+  verify-macos:
+    name: Check the signed macOS app with Apple tools
     needs: verify
-    runs-on: ubuntu-24.04
-    environment: release
+    runs-on: macos-15
     permissions:
-      contents: write # read the draft release
+      contents: read # fetch the pipeline scripts
     steps:
       - name: Fetch the pipeline scripts at the commit of this run
         env:
@@ -71,34 +213,442 @@ jobs:
           set -euo pipefail
           mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
 
-      - name: Fetch the verified release files
+      - name: Download the verified files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: verified-release
+          path: verified
+
+      - name: Check the verified files
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
         run: |
           set -euo pipefail
-          repo/dev-scripts/release/finalize-release.sh fetch --tag "$TAG" --repo "$GITHUB_REPOSITORY" --manifest-sha256 "$MANIFEST_SHA256" --dir verified
+          command -v gpg >/dev/null || brew install gnupg
+          repo/dev-scripts/release/finalize-release.sh check-set --dir verified \
+            --manifest-sha256 "$MANIFEST_SHA256" --repo-root repo
 
-      - name: Publish (stand-in)
+      # Sandbox only: the throwaway signing certificate is self-signed. This
+      # makes the runner trust it for code signing, so that the requirement
+      # "anchor trusted" in config.json holds. The real workflow has no such
+      # step: the real requirement anchors at Apple.
+      - name: Trust the throwaway signing certificate (sandbox test setup)
+        run: /bin/bash repo/sandbox/macos/trust-cert.sh repo/sandbox/macos/certs/sandbox-signer.crt
+
+      - name: Check the app and the DMG files
         env:
-          PUBLISH_TOKEN: ${{ secrets.SANDBOX_PUBLISH_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
         run: |
           set -euo pipefail
-          if [ -z "${PUBLISH_TOKEN:-}" ]; then
-            echo "::error::The publish token is empty. Check the secret of the release environment."
-            exit 1
-          fi
-          echo "The publish token is present. A real job would publish these files:"
-          ls -l verified
+          # CONTRACT: finalize-release.sh verify-macos --tag TAG --dir DIR --repo-root DIR
+          # checks every *.dmg and *.app.tar.gz in DIR (checked above) with
+          # verify-macos.sh and the team id, requirement, bundle id,
+          # entitlements, and notarization policy of the repository.
+          repo/dev-scripts/release/finalize-release.sh verify-macos --tag "$TAG" --dir verified --repo-root repo
+          echo "verify-macos: $TAG passed, manifest sha256 $MANIFEST_SHA256" >>"$GITHUB_STEP_SUMMARY"
 
-  publish:
-    name: Publish the release
-    needs: [verify, publish-targets]
+  flatpak-prepare:
+    name: Prepare the signed Flatpak repository
+    needs: verify
+    if: needs.verify.outputs.flatpak == 'true'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write # publish the release
-      actions: write # read the build run and start the follow-up workflow
+      contents: read # fetch the pipeline scripts
+      actions: read # download the unsigned Flatpak repository of the build run
+    outputs:
+      site_sha256: ${{ steps.pack.outputs.site_sha256 }}
+    steps:
+      - name: Fetch the pipeline scripts at the commit of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
+
+      - name: Install the Flatpak tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q flatpak ostree gir1.2-ostree-1.0 python3-gi gnupg
+
+      - name: Download the verified files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: verified-release
+          path: verified
+
+      - name: Check the verified files
+        env:
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          repo/dev-scripts/release/finalize-release.sh check-set --dir verified \
+            --manifest-sha256 "$MANIFEST_SHA256" --repo-root repo
+
+      # flatpak-repo.tar has the origin ci in config.json: it is never a
+      # release file, so the build run is its only source. It needs no hash
+      # check here: the step below accepts it only if its refs, commits, and
+      # summaries match the detached signatures in the verified
+      # flatpak-signatures.tar.
+      - name: Download the unsigned Flatpak repository of the build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::build run id is not a number: $BUILD_RUN_ID"; exit 1; }
+          # shellcheck source=/dev/null
+          . repo/dev-scripts/release/lib.sh
+          export REPO_ROOT="$PWD/repo"
+          load_config
+          download_build_artifacts "$GITHUB_REPOSITORY" "$BUILD_RUN_ID" "$RUNNER_TEMP/ci" "$CFG_CI_ARTIFACT_PATTERN"
+          [ -f "$RUNNER_TEMP/ci/flatpak-repo.tar" ] ||
+            die "the artifacts of build run $BUILD_RUN_ID that match $CFG_CI_ARTIFACT_PATTERN hold no flatpak-repo.tar"
+
+      - name: Verify the signatures and build the gh-pages content
+        env:
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          # CONTRACT: finalize-release.sh flatpak --tag TAG --dir DIR --manifest-sha256 HEX --repo-tar FILE --out DIR --repo-root DIR
+          # takes flatpak-signatures.tar from the verified set in --dir, runs
+          # flatpak-finalize.sh on --repo-tar with the Flatpak key, app id,
+          # refs, and templates of the repository, and writes the complete
+          # gh-pages content to the new --out directory.
+          repo/dev-scripts/release/finalize-release.sh flatpak --tag "$TAG" --dir verified \
+            --manifest-sha256 "$MANIFEST_SHA256" --repo-tar "$RUNNER_TEMP/ci/flatpak-repo.tar" \
+            --out "$RUNNER_TEMP/site" --repo-root repo
+          # The marker of the release that gh-pages holds. publish-flatpak of
+          # a later run reads it and refuses to go back to an older version.
+          [ ! -e "$RUNNER_TEMP/site/release-info.json" ] || { echo "::error::The gh-pages content has a release-info.json already."; exit 1; }
+          jq -n --arg tag "$TAG" --arg version "$VERSION" --arg manifest "$MANIFEST_SHA256" \
+            '{tag: $tag, version: $version, manifest_sha256: $manifest}' >"$RUNNER_TEMP/site/release-info.json"
+
+      # A tar keeps hidden files (.nojekyll), empty directories, and modes.
+      # publish-flatpak checks this hash before it pushes anything.
+      - name: Pack the gh-pages content
+        id: pack
+        env:
+          TAG: ${{ inputs.tag }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir upload
+          (cd "$RUNNER_TEMP/site" && find . -mindepth 1 -print | LC_ALL=C sort |
+            tar --no-recursion --owner=0 --group=0 --numeric-owner --mtime=@0 -cf "$GITHUB_WORKSPACE/upload/flatpak-site.tar" -T -)
+          echo "site_sha256=$(sha256sum upload/flatpak-site.tar | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
+          echo "flatpak-prepare: $TAG gh-pages content built, manifest sha256 $MANIFEST_SHA256" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the gh-pages content
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flatpak-site
+          path: upload/flatpak-site.tar
+          if-no-files-found: error
+          overwrite: true
+
+  store-upload:
+    name: Plan the upload to the update store (stand-in)
+    needs: [verify, verify-macos, flatpak-prepare]
+    # No file leaves GitHub before all checks of phase A passed.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && needs.verify-macos.result == 'success'
+      && (needs.flatpak-prepare.result == 'success'
+          || (needs.flatpak-prepare.result == 'skipped' && needs.verify.outputs.flatpak != 'true'))
+      && needs.verify.outputs.store == 'true'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read # fetch the pipeline scripts
+    steps:
+      - name: Fetch the pipeline scripts at the commit of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir repo && gh api "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" | tar -xz --strip-components=1 -C repo
+
+      - name: Download the verified files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: verified-release
+          path: verified
+
+      - name: Check the verified files and plan the upload
+        env:
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          repo/dev-scripts/release/finalize-release.sh check-set --dir verified \
+            --manifest-sha256 "$MANIFEST_SHA256" --repo-root repo
+          # shellcheck source=/dev/null
+          . repo/dev-scripts/release/lib.sh
+          names="$(list_dir verified)"
+          plan=""
+          add() {
+            local pattern="$1" update="$2" public="$3" name match=""
+            while IFS= read -r name; do
+              # shellcheck disable=SC2254 # the pattern is a glob on purpose
+              case "$name" in
+              *.asc | *.sig) continue ;;
+              $pattern)
+                [ -z "$match" ] || die "two release files match $pattern: $match and $name"
+                match="$name"
+                ;;
+              esac
+            done <<<"$names"
+            [ -n "$match" ] || die "no release file matches $pattern"
+            [ -z "$update" ] || [ -f "verified/$match.sig" ] || die "the release has no $match.sig"
+            plan="$plan$match ${update:--} ${public:--}"$'\n'
+          }
+          add '*_amd64.AppImage' linux-x86_64-appimage appimage-x86_64
+          add '*_amd64.deb' linux-x86_64-deb debian-x86_64
+          add '*_x64-setup.exe' windows-x86_64-nsis nsis-x86_64
+          add '*_aarch64.app.tar.gz' darwin-aarch64-app ''
+          add '*_x64.app.tar.gz' darwin-x86_64-app ''
+          add '*_aarch64.dmg' '' dmg-aarch64
+          add '*_x64.dmg' '' dmg-x86_64
+          printf '%s' "$plan" >plan.txt
+          cat plan.txt
+
+      - name: Stand-in for the upload
+        env:
+          TAG: ${{ inputs.tag }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          echo "The sandbox has no update store. It would upload:"
+          cat plan.txt
+          echo "store-upload: $TAG planned (stand-in), manifest sha256 $MANIFEST_SHA256" >>"$GITHUB_STEP_SUMMARY"
+
+  publish-flatpak:
+    name: Push the Flatpak repository to gh-pages
+    needs: [verify, verify-macos, flatpak-prepare, store-upload]
+    # Runs only after every check of phase A passed, before the publication.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && needs.verify-macos.result == 'success'
+      && needs.flatpak-prepare.result == 'success'
+      && (needs.store-upload.result == 'success'
+          || (needs.store-upload.result == 'skipped' && needs.verify.outputs.store != 'true'))
+      && needs.verify.outputs.flatpak == 'true'
+    runs-on: ubuntu-24.04
+    environment: release
+    # One tag at a time changes the Flatpak site. A newer pending run
+    # replaces an older pending one; the older one shows as cancelled.
+    concurrency:
+      group: release-channel-flatpak-pages
+      cancel-in-progress: false
+    permissions:
+      contents: write # push gh-pages and gh-pages-previous
+    steps:
+      - name: Install the version comparison
+        run: |
+          set -euo pipefail
+          cat >"$RUNNER_TEMP/semver.sh" <<'EOF'
+          # semver_cmp A B: prints -1, 0, or 1 when version A is lower than,
+          # equal to, or higher than version B, by the precedence rules of
+          # Semantic Versioning 2.0.0 (build metadata does not count). Returns 2
+          # unless both are semantic versions without a leading "v".
+          semver_cmp() {
+            local LC_ALL=C re a="$1" b="$2" ac bc ap="" bp="" i r x y
+            local -a an bn ai bi
+            re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+            [[ "$a" =~ $re ]] && [[ "$b" =~ $re ]] || return 2
+            a="${a%%+*}" b="${b%%+*}"
+            ac="${a%%-*}" bc="${b%%-*}"
+            [[ "$a" != *-* ]] || ap="${a#*-}"
+            [[ "$b" != *-* ]] || bp="${b#*-}"
+            IFS=. read -r -a an <<<"$ac"
+            IFS=. read -r -a bn <<<"$bc"
+            for i in 0 1 2; do
+              r="$(_semver_num_cmp "${an[$i]}" "${bn[$i]}")"
+              [ "$r" = 0 ] || { echo "$r"; return 0; }
+            done
+            # A version without a pre-release part ranks above one with it.
+            if [ -z "$ap" ] || [ -z "$bp" ]; then
+              if [ -z "$ap" ] && [ -z "$bp" ]; then echo 0; elif [ -z "$ap" ]; then echo 1; else echo -1; fi
+              return 0
+            fi
+            IFS=. read -r -a ai <<<"$ap"
+            IFS=. read -r -a bi <<<"$bp"
+            for ((i = 0; ; i++)); do
+              if [ "$i" -ge "${#ai[@]}" ] && [ "$i" -ge "${#bi[@]}" ]; then echo 0; return 0; fi
+              [ "$i" -lt "${#ai[@]}" ] || { echo -1; return 0; }
+              [ "$i" -lt "${#bi[@]}" ] || { echo 1; return 0; }
+              x="${ai[$i]}" y="${bi[$i]}"
+              if [[ "$x" =~ ^[0-9]+$ ]] && [[ "$y" =~ ^[0-9]+$ ]]; then
+                r="$(_semver_num_cmp "$x" "$y")"
+              elif [[ "$x" =~ ^[0-9]+$ ]]; then
+                r=-1
+              elif [[ "$y" =~ ^[0-9]+$ ]]; then
+                r=1
+              elif [[ "$x" < "$y" ]]; then
+                r=-1
+              elif [[ "$x" > "$y" ]]; then
+                r=1
+              else
+                r=0
+              fi
+              [ "$r" = 0 ] || { echo "$r"; return 0; }
+            done
+          }
+
+          # _semver_num_cmp X Y: compares two numbers without leading zeros,
+          # of any length.
+          _semver_num_cmp() {
+            local LC_ALL=C
+            if [ "${#1}" -ne "${#2}" ]; then
+              if [ "${#1}" -lt "${#2}" ]; then echo -1; else echo 1; fi
+            elif [[ "$1" < "$2" ]]; then
+              echo -1
+            elif [[ "$1" > "$2" ]]; then
+              echo 1
+            else
+              echo 0
+            fi
+          }
+          EOF
+          # shellcheck source=/dev/null
+          . "$RUNNER_TEMP/semver.sh"
+          # A self-test, so that a broken copy fails here and not at the gate.
+          [ "$(semver_cmp 1.0.0-rc.1 1.0.0)" = -1 ] && [ "$(semver_cmp 1.10.0 1.9.0)" = 1 ] &&
+            [ "$(semver_cmp 1.0.0-beta.11 1.0.0-beta.2)" = 1 ] && [ "$(semver_cmp 1.0.0+a 1.0.0+b)" = 0 ] ||
+            { echo "::error::The version comparison fails its self-test."; exit 1; }
+
+      - name: Download the prepared gh-pages content
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: flatpak-site
+          path: ${{ runner.temp }}/artifact
+
+      - name: Check the prepared gh-pages content
+        env:
+          TAG: ${{ inputs.tag }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+          SITE_SHA256: ${{ needs.flatpak-prepare.outputs.site_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SITE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::No hash of the gh-pages content."; exit 1; }
+          echo "$SITE_SHA256  $RUNNER_TEMP/artifact/flatpak-site.tar" | sha256sum -c -
+          mkdir site
+          tar -xf "$RUNNER_TEMP/artifact/flatpak-site.tar" -C site --no-same-owner
+          [ -f site/.nojekyll ] || { echo "::error::The gh-pages content has no .nojekyll."; exit 1; }
+          [ "$(jq -r '"\(.tag) \(.manifest_sha256)"' site/release-info.json)" = "$TAG $MANIFEST_SHA256" ] ||
+            { echo "::error::release-info.json of the gh-pages content does not name $TAG and $MANIFEST_SHA256."; exit 1; }
+
+      - name: Push to gh-pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . "$RUNNER_TEMP/semver.sh"
+          # The token reaches git through the environment, never through a
+          # command line or a remote URL.
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_VALUE_0
+          export GIT_AUTHOR_NAME="github-actions[bot]" GIT_COMMITTER_NAME="github-actions[bot]"
+          export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          summary() {
+            echo "publish-flatpak: $TAG on gh-pages, manifest sha256 $MANIFEST_SHA256" >>"$GITHUB_STEP_SUMMARY"
+          }
+
+          cd site
+          git init -q
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git add -A
+          tree="$(git write-tree)"
+
+          old=""
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch -q --depth=1 origin refs/heads/gh-pages
+            old="$(git rev-parse FETCH_HEAD)"
+          fi
+          if [ -n "$old" ] && [ "$(git rev-parse "$old^{tree}")" = "$tree" ]; then
+            echo "::notice::gh-pages holds this content already. Nothing to push."
+            summary
+            exit 0
+          fi
+
+          # Never move the site back. release-info.json names the release
+          # that gh-pages holds. Sites from before this pipeline have none.
+          if [ -n "$old" ] && info="$(git show "$old:release-info.json" 2>/dev/null)"; then
+            current="$(jq -r '.version | strings' <<<"$info")" || current=""
+            current_manifest="$(jq -r '.manifest_sha256 | strings' <<<"$info")" || current_manifest=""
+            rc=0
+            order="$(semver_cmp "$current" "$VERSION")" || rc=$?
+            [ "$rc" = 0 ] || { echo "::error::release-info.json on gh-pages names '$current', not a semantic version."; exit 1; }
+            case "$order" in
+            1)
+              echo "::error::gh-pages holds version $current, newer than $VERSION. Refusing to move the Flatpak site back."
+              exit 1
+              ;;
+            0)
+              [ "$current_manifest" = "$MANIFEST_SHA256" ] || {
+                echo "::error::gh-pages holds version $current with the manifest sha256 $current_manifest, not $MANIFEST_SHA256. A human must check gh-pages."
+                exit 1
+              }
+              ;;
+            esac
+            echo "gh-pages holds version $current now."
+          else
+            echo "::notice::gh-pages has no release-info.json. This is the first push of the new pipeline."
+          fi
+
+          # Keep one rollback step. If gh-pages holds an earlier attempt for
+          # this same tag, gh-pages-previous holds the real previous release
+          # already, so keep it.
+          trailer="Release-Tag: $TAG"
+          if [ -n "$old" ]; then
+            if git log -1 --format=%B "$old" | grep -qxF "$trailer"; then
+              echo "gh-pages holds an earlier attempt for $TAG. gh-pages-previous stays as it is."
+            else
+              git push -q origin "+$old:refs/heads/gh-pages-previous"
+              echo "Saved the previous gh-pages head $old as gh-pages-previous."
+            fi
+          fi
+
+          commit="$(printf 'Flatpak repository for release %s\n\n%s\n' "$TAG" "$trailer" | git commit-tree "$tree")"
+          # The lease fails the push if gh-pages moved after the fetch above.
+          git push -q --force-with-lease="refs/heads/gh-pages:$old" origin "$commit:refs/heads/gh-pages"
+          echo "Pushed $commit to gh-pages (previous head: ${old:-none})."
+          summary
+
+  publish-github:
+    name: Publish the GitHub release
+    needs: [verify, verify-macos, flatpak-prepare, store-upload, publish-flatpak]
+    # Optional channels are skipped on purpose for previews and test
+    # releases. Every job that should run must have passed. This job is the
+    # last one: the publication is the last action of the pipeline.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && needs.verify-macos.result == 'success'
+      && (needs.flatpak-prepare.result == 'success'
+          || (needs.flatpak-prepare.result == 'skipped' && needs.verify.outputs.flatpak != 'true'))
+      && (needs.store-upload.result == 'success'
+          || (needs.store-upload.result == 'skipped' && needs.verify.outputs.store != 'true'))
+      && (needs.publish-flatpak.result == 'success'
+          || (needs.publish-flatpak.result == 'skipped' && needs.verify.outputs.flatpak != 'true'))
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write # publish the draft release on the existing tag
+      actions: read # read the build run
     steps:
       - name: Fetch the pipeline scripts at the commit of this run
         env:
@@ -120,12 +670,25 @@ jobs:
           MANIFEST_SHA256: ${{ needs.verify.outputs.manifest_sha256 }}
         run: |
           set -euo pipefail
-          repo/dev-scripts/release/finalize-release.sh publish --tag "$TAG" --run-id "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --manifest-sha256 "$MANIFEST_SHA256" --repo-root repo
-
-      - name: Start the post-release workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          gh workflow run post-release.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f tag="$TAG"
+          # shellcheck source=/dev/null
+          . repo/dev-scripts/release/lib.sh
+          release="$(find_release "$GITHUB_REPOSITORY" "$TAG")"
+          if [ "$(jq -r .draft <<<"$release")" = false ]; then
+            # A re-run: publish happened in an earlier attempt. The verify job
+            # of this run checked the published release with this manifest.
+            echo "::notice::Release $TAG is published already."
+          else
+            # No workflow creates a release tag. The signing script pushes
+            # it with the login of the maintainer before it starts this
+            # workflow. Publishing a draft without its tag would make
+            # GitHub create the tag with the job token.
+            commit="$(jq -r .target_commitish <<<"$release")"
+            tagged="$(tag_commit "$GITHUB_REPOSITORY" "$TAG")"
+            [ -n "$tagged" ] ||
+              die "git tag $TAG does not exist. The signing script pushes it before it starts this workflow. Push the tag $TAG at $commit with your own login, then run the failed jobs again."
+            [ "$tagged" = "$commit" ] ||
+              die "git tag $TAG points to $tagged, not to the release commit $commit."
+            repo/dev-scripts/release/finalize-release.sh publish --tag "$TAG" --run-id "$BUILD_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" --manifest-sha256 "$MANIFEST_SHA256" --repo-root repo
+          fi
+          echo "publish-github: $TAG published, manifest sha256 $MANIFEST_SHA256" >>"$GITHUB_STEP_SUMMARY"

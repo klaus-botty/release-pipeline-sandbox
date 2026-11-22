@@ -6,12 +6,17 @@
 #   - SHA256SUMS has one good signature from an allowed signer,
 #   - the directory holds exactly the files that SHA256SUMS lists, with the
 #     same hashes,
+#   - these files are exactly the release files that the products in
+#     config.json require: the build and local products, the build info,
+#     latest.json (if a product has updater platforms), the .asc and .sig
+#     files, and no input or ci product,
 #   - release-build-info.json names this repository, tag, commit, and build run,
-#   - every release file has a good detached signature (<file>.asc),
-#   - every updater file has a good updater signature (<file>.sig), and its
-#     trusted comment names exactly this file and the release version,
-#   - latest.json matches the release version, the updater files, and their
-#     signatures.
+#   - every released file has a good detached signature (<file>.asc),
+#   - every product with updater platforms has a good updater signature
+#     (<file>.sig), and its trusted comment names exactly this file and the
+#     release version,
+#   - latest.json matches the release version, and lists exactly the updater
+#     platforms of the configuration, each with its file and signature.
 #
 # The release version is the tag without one leading "v".
 #
@@ -49,7 +54,7 @@ valid_commit "$commit" || die "commit is not a full SHA: $commit"
 need_tools gpg jq minisign base64
 load_config
 load_allowed_signers
-if uses_updater; then
+if needs_release_version; then
 	set_release_version "$tag"
 fi
 
@@ -65,76 +70,57 @@ verify_detached "$dir/$MANIFEST_SIG_NAME" "$manifest" ||
 	die "$MANIFEST_NAME has no good signature from an allowed signer"
 check_manifest "$manifest"
 
-# 2. The directory holds exactly the files of the manifest.
+# 2. The directory holds exactly the files of the manifest, and these are
+# exactly the files that the products require.
 check_files_against_manifest "$dir" "$manifest" "$MANIFEST_NAME" "$MANIFEST_SIG_NAME"
+names="$(list_dir "$dir")"
+while IFS= read -r name; do
+	case "$name" in
+	*.unsigned.*) die "$name is an unsigned file. A release never holds one." ;;
+	esac
+done <<<"$names"
+require_product_set release "the release" "$names"
 
 # 3. The files belong to this release.
 check_build_info "$dir/$BUILD_INFO_NAME" "$repo" "$tag" "$commit" "$run_id"
 
-# 4. Detached signatures and updater signatures.
-names="$(manifest_names "$manifest")"
-has_updater_assets=0
-pubkey="$work/updater.pub"
+# 4. Detached signatures of every released file.
+released="$(released_names)" || die "cannot list the released files"
 while IFS= read -r name; do
-	case "$name" in
-	*.asc)
-		grep -qxF -- "${name%.asc}" <<<"$names" || die "$name has no file that it signs"
-		case "${name%.asc}" in
-		*.asc | *.sig) die "$name signs a signature file" ;;
-		esac
-		;;
-	*.sig)
-		grep -qxF -- "${name%.sig}" <<<"$names" || die "$name has no file that it signs"
-		is_updater_asset "${name%.sig}" || die "$name signs a file that is not an updater file"
-		;;
-	*)
-		verify_detached "$dir/$name.asc" "$dir/$name" ||
-			die "$name has no good signature from an allowed signer"
-		if is_updater_asset "$name"; then
-			if [ "$has_updater_assets" = 0 ]; then
-				write_updater_pubkey "$pubkey"
-				has_updater_assets=1
-			fi
-			[ -f "$dir/$name.sig" ] || die "$name has no updater signature ($name.sig)"
-			verify_updater_sig "$pubkey" "$dir/$name.sig" "$dir/$name" "$RELEASE_VERSION"
-		fi
-		;;
-	esac
-done <<<"$names"
+	[ -n "$name" ] || continue
+	verify_detached "$dir/$name.asc" "$dir/$name" ||
+		die "$name has no good signature from an allowed signer"
+done <<<"$released"
 
-# 5. latest.json matches the updater files.
-if [ "$has_updater_assets" = 1 ]; then
+# 5. Updater signatures and latest.json. The list comes from the
+# configuration, never from the files that happen to be present.
+if uses_updater; then
+	pubkey="$work/updater.pub"
+	write_updater_pubkey "$pubkey"
+	updater_names="$(updater_product_names)" || die "cannot list the updater products"
 	latest="$dir/latest.json"
-	[ -f "$latest" ] || die "latest.json is missing"
-	latest_version="$(jq -r .version "$latest")"
+	latest_version="$(jq -r '.version | strings' "$latest")" || die "latest.json is not valid JSON"
 	[ "$latest_version" = "$RELEASE_VERSION" ] ||
 		die "latest.json has the wrong version: $latest_version, but the release version is $RELEASE_VERSION"
 	expected_platforms=""
-	count="$(updater_target_count)"
-	i=0
-	while [ "$i" -lt "$count" ]; do
-		pattern="$(updater_target_pattern "$i")"
-		while IFS= read -r name; do
-			# shellcheck disable=SC2254 # the pattern is a glob on purpose
-			case "$name" in
-			*.asc | *.sig) continue ;;
-			$pattern) ;;
-			*) continue ;;
-			esac
-			while IFS= read -r platform; do
-				expected_platforms="$expected_platforms$platform"$'\n'
-				url="https://github.com/$repo/releases/download/$tag/$name"
-				jq -e --arg p "$platform" --arg url "$url" --rawfile sig "$dir/$name.sig" \
-					'.platforms[$p].url == $url and .platforms[$p].signature == $sig' "$latest" >/dev/null ||
-					die "latest.json has a wrong entry for $platform"
-			done < <(updater_target_platforms "$i")
-		done <<<"$names"
-		i=$((i + 1))
-	done
-	actual_platforms="$(jq -r '.platforms | keys[]' "$latest" | LC_ALL=C sort)"
+	while IFS= read -r name; do
+		[ -n "$name" ] || continue
+		verify_updater_sig "$pubkey" "$dir/$name.sig" "$dir/$name" "$RELEASE_VERSION"
+		platforms="$(product_updater_platforms "$name")" || die "cannot list the updater platforms of $name"
+		[ -n "$platforms" ] || die "internal error: $name has no updater platforms"
+		url="https://github.com/$repo/releases/download/$tag/$name"
+		while IFS= read -r platform; do
+			expected_platforms="$expected_platforms$platform"$'\n'
+			jq -e --arg p "$platform" --arg url "$url" --rawfile sig "$dir/$name.sig" \
+				'.platforms[$p] == {signature: $sig, url: $url}' "$latest" >/dev/null ||
+				die "latest.json has a wrong entry for $platform"
+		done <<<"$platforms"
+	done <<<"$updater_names"
+	actual_platforms="$(jq -r '.platforms | keys[]' "$latest" | LC_ALL=C sort)" ||
+		die "latest.json has no platform list"
 	expected_platforms="$(printf '%s' "$expected_platforms" | LC_ALL=C sort)"
 	[ "$actual_platforms" = "$expected_platforms" ] ||
-		die "latest.json does not list exactly the platforms of the updater files"
+		die "latest.json does not list exactly the updater platforms of the configuration"
 fi
 
 log "verified: $(wc -l <"$manifest" | tr -d ' ') files of $repo $tag at commit $commit, build run $run_id"

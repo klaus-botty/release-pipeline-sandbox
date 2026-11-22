@@ -1,21 +1,79 @@
 {
   "repository": "klaus-botty/release-pipeline-sandbox",
   "build_workflow": "build-release.yml",
+  "build_event": "workflow_dispatch",
   "finalize_workflow": "finalize-release.yml",
   "artifact_pattern": "release-*",
+  "ci_artifact_pattern": "ci-*",
   "signer_keys_dir": "utils/gpg_keys",
   "allowed_signers": "dev-scripts/release/allowed-signers.txt",
   "updater": {
     "pubkey_file": "src-tauri/tauri.conf.json",
     "pubkey_jq": ".plugins.updater.pubkey",
     "version_file": "src-tauri/tauri.conf.json",
-    "version_jq": ".version",
-    "targets": [
-      { "pattern": "*_amd64.AppImage", "platforms": ["linux-x86_64", "linux-x86_64-appimage"] },
-      { "pattern": "*_amd64.deb", "platforms": ["linux-x86_64-deb"] },
-      { "pattern": "*_x64-setup.exe", "platforms": ["windows-x86_64", "windows-x86_64-nsis"] },
-      { "pattern": "*_aarch64.app.tar.gz", "platforms": ["darwin-aarch64", "darwin-aarch64-app"] },
-      { "pattern": "*_x64.app.tar.gz", "platforms": ["darwin-x86_64", "darwin-x86_64-app"] }
-    ]
-  }
+    "version_jq": ".version"
+  },
+  "apple": {
+    "entitlements_file": "sandbox/macos/app/entitlements.plist",
+    "notarize": false,
+    "requirement": "anchor trusted and certificate leaf[subject.OU] = \"ZZTEST0001\"",
+    "team_id": "ZZTEST0001",
+    "bundle_id": "org.example.sandboxapp"
+  },
+  "flatpak": {
+    "app_id": "org.example.SandboxApp",
+    "arch": "x86_64",
+    "branch": "stable",
+    "extra_refs": [
+      "runtime/org.example.SandboxApp.Locale/x86_64/stable",
+      "runtime/org.example.Platform/x86_64/1"
+    ],
+    "fingerprint": "D43E8EEF6859EFBFA187BA9F01A061BFFEE1FDFF",
+    "bundle_name": "org.example.SandboxApp.flatpak",
+    "pages": [
+      "sandbox/flatpak/templates/index.html",
+      "sandbox/flatpak/templates/sandbox.flatpakrepo",
+      "sandbox/flatpak/templates/org.example.SandboxApp.flatpakref",
+      "sandbox/flatpak/templates/icon.png",
+      "sandbox/flatpak/templates/README.md"
+    ],
+    "url": "https://klaus-botty.github.io/release-pipeline-sandbox",
+    "homepage": "https://github.com/klaus-botty/release-pipeline-sandbox",
+    "to_sign": "flatpak-to-sign.tar",
+    "repo_tar": "flatpak-repo.tar",
+    "signatures": "flatpak-signatures.tar"
+  },
+  "homebrew": {
+    "generator": "dev-scripts/homebrew/generate-formula.sh",
+    "output": "sandboxapp.rb",
+    "dmg": {
+      "aarch64": "sandboxapp_{version}_aarch64.dmg",
+      "x64": "sandboxapp_{version}_x64.dmg"
+    }
+  },
+  "products": [
+    {"name": "tool_{version}_Linux_x86_64.tar", "origin": "build"},
+    {"name": "tool_{version}_Darwin_aarch64.tar", "origin": "build"},
+    {"name": "tool_{version}_Darwin_x86_64.tar", "origin": "build"},
+    {"name": "tool_{version}_Windows_x86_64.zip", "origin": "build"},
+    {"name": "helper_{version}_Linux_x86_64.tar", "origin": "build"},
+    {"name": "helper_{version}_Darwin_aarch64.tar", "origin": "build"},
+    {"name": "helper_{version}_Darwin_x86_64.tar", "origin": "build"},
+    {"name": "helper_{version}_Windows_x86_64.zip", "origin": "build"},
+    {"name": "sandboxapp_{version}_amd64.AppImage", "origin": "build", "updater": ["linux-x86_64", "linux-x86_64-appimage"]},
+    {"name": "sandboxapp_{version}_amd64.deb", "origin": "build", "updater": ["linux-x86_64-deb"]},
+    {"name": "sandboxapp_{version}_x64-setup.exe", "origin": "build", "updater": ["windows-x86_64", "windows-x86_64-nsis"]},
+    {"name": "sandboxapp_aarch64.app.unsigned.tar", "origin": "input"},
+    {"name": "sandboxapp_x64.app.unsigned.tar", "origin": "input"},
+    {"name": "sandboxapp_{version}_aarch64.unsigned.dmg", "origin": "input"},
+    {"name": "sandboxapp_{version}_x64.unsigned.dmg", "origin": "input"},
+    {"name": "flatpak-to-sign.tar", "origin": "input"},
+    {"name": "flatpak-repo.tar", "origin": "ci"},
+    {"name": "sandboxapp_aarch64.app.tar.gz", "origin": "local", "updater": ["darwin-aarch64", "darwin-aarch64-app"]},
+    {"name": "sandboxapp_x64.app.tar.gz", "origin": "local", "updater": ["darwin-x86_64", "darwin-x86_64-app"]},
+    {"name": "sandboxapp_{version}_aarch64.dmg", "origin": "local"},
+    {"name": "sandboxapp_{version}_x64.dmg", "origin": "local"},
+    {"name": "flatpak-signatures.tar", "origin": "local"},
+    {"name": "sandboxapp.rb", "origin": "local"}
+  ]
 }

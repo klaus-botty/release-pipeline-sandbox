@@ -4,8 +4,9 @@
 # Applications link, a .background directory with an image, and a
 # .VolumeIcon.icns with the custom icon flag on the volume.
 #
-# Usage: build.sh ARCH OUT_DIR    (ARCH: aarch64 or x64)
-# Writes OUT_DIR/sandboxapp.app and OUT_DIR/sandboxapp_1.2.3_ARCH.dmg.
+# Usage: build.sh ARCH OUT_DIR [VERSION]   (ARCH: aarch64 or x64; VERSION
+# defaults to 1.2.3 and goes into Info.plist and the DMG name)
+# Writes OUT_DIR/sandboxapp.app and OUT_DIR/sandboxapp_VERSION_ARCH.dmg.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -15,7 +16,8 @@ aarch64) clang_arch=arm64 ;;
 x64) clang_arch=x86_64 ;;
 *) echo "unknown architecture $arch" >&2; exit 1 ;;
 esac
-version=1.2.3
+version="${3:-1.2.3}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION must be like 1.2.3: $version" >&2; exit 1; }
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 work="$(mktemp -d)"
@@ -38,7 +40,7 @@ sips -s format icns "$work/icon.png" --out "$work/icon.icns" >/dev/null
 app="$out/sandboxapp.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 clang -arch "$clang_arch" -O2 -o "$app/Contents/MacOS/sandboxapp" "$here/app/main.c"
-cp "$here/app/Info.plist" "$app/Contents/Info.plist"
+sed "s|<string>1\.2\.3</string>|<string>$version</string>|g" "$here/app/Info.plist" >"$app/Contents/Info.plist"
 cp "$work/icon.icns" "$app/Contents/Resources/icon.icns"
 cp "$here/app/resource.txt" "$app/Contents/Resources/resource.txt"
 printf 'APPL????' >"$app/Contents/PkgInfo"

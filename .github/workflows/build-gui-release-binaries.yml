@@ -1,0 +1,222 @@
+# Sandbox stand-in for the GUI build. It holds no secret and writes nothing.
+#
+# The job graph, the matrix, the collect steps, the artifact names, and the
+# script calls are the same as in the real GUI build workflow. Only the build
+# steps differ:
+# - macOS: sandbox/macos/build.sh builds a tiny real, unsigned .app and a DMG
+#   with a Tauri-like layout, in the bundle layout of the Tauri CLI.
+# - Linux and Windows: random bytes with the bundle names of the Tauri CLI.
+# - Flatpak: sandbox/flatpak/build-dummy.sh builds a dummy app into an
+#   unsigned repository instead of flatpak-builder.
+#
+# workflow_call (from build-release.yml): upload the unsigned outputs as the
+# workflow artifacts release-gui-<target>. With the input flatpak, also upload
+# release-gui-flatpak (flatpak-to-sign.tar, which the signing script downloads
+# and signs) and ci-gui-flatpak-repo (flatpak-repo.tar, which only the
+# finalize workflow downloads). The artifact name patterns release-* and ci-*
+# come from dev-scripts/release/config.json (artifact_pattern and
+# ci_artifact_pattern).
+name: "Build sandboxapp release"
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag. The caller validates it.
+        type: string
+        required: true
+      ref:
+        description: Commit to check out. Empty means the commit of the run.
+        type: string
+        required: false
+        default: ""
+      flatpak:
+        description: Also build the unsigned Flatpak repository.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-gui-release-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build_gui:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: "macos-15" # for Arm based macs (M1 and above).
+            target: "aarch64-apple-darwin"
+          - host: "macos-15-intel" # for Intel based macs.
+            target: "x86_64-apple-darwin"
+          - host: "ubuntu-24.04"
+            target: "x86_64-unknown-linux-gnu"
+          - host: "ubuntu-24.04" # cross build windows from ubuntu
+            target: "x86_64-pc-windows-gnu"
+
+    runs-on: ${{ matrix.host }}
+
+    env:
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # Stand-in for "tauri build": writes the bundles where the Tauri CLI
+      # writes them, with the version of src-tauri/tauri.conf.json.
+      - name: Build the app (unsigned, stand-in)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          bundle="target/$TARGET/release/bundle"
+          case "$TARGET" in
+          aarch64-apple-darwin | x86_64-apple-darwin)
+            case "$TARGET" in
+            aarch64-*) arch=aarch64 ;;
+            *) arch=x64 ;;
+            esac
+            /bin/bash sandbox/macos/build.sh "$arch" "$RUNNER_TEMP/build" "$version"
+            mkdir -p "$bundle/macos" "$bundle/dmg"
+            mv "$RUNNER_TEMP/build/sandboxapp.app" "$bundle/macos/"
+            mv "$RUNNER_TEMP/build/sandboxapp_${version}_${arch}.dmg" "$bundle/dmg/"
+            ;;
+          *-linux-*)
+            mkdir -p "$bundle/appimage" "$bundle/deb"
+            head -c $((8 * 1024 * 1024)) /dev/urandom >"$bundle/appimage/sandboxapp_${version}_amd64.AppImage"
+            head -c $((4 * 1024 * 1024)) /dev/urandom >"$bundle/deb/sandboxapp_${version}_amd64.deb"
+            ;;
+          *-windows-*)
+            mkdir -p "$bundle/nsis"
+            head -c $((6 * 1024 * 1024)) /dev/urandom >"$bundle/nsis/sandboxapp_${version}_x64-setup.exe"
+            ;;
+          *)
+            echo "::error::No stand-in build for $TARGET"
+            exit 1
+            ;;
+          esac
+          find "$bundle" -maxdepth 2 -print
+
+      - name: Collect the Linux and Windows bundles
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle="target/$TARGET/release/bundle"
+          case "$TARGET" in
+          *-linux-*) patterns=("appimage/*.AppImage" "deb/*.deb") ;;
+          *-windows-*) patterns=("nsis/*-setup.exe") ;;
+          *)
+            echo "::error::No bundle list for $TARGET"
+            exit 1
+            ;;
+          esac
+
+          mkdir dist
+          shopt -s nullglob
+          for pattern in "${patterns[@]}"; do
+            # shellcheck disable=SC2206 # the pattern is a glob on purpose
+            matches=($bundle/$pattern)
+            if [ "${#matches[@]}" != 1 ]; then
+              echo "::error::Expected one file for $bundle/$pattern, found ${#matches[@]}: ${matches[*]}"
+              exit 1
+            fi
+            cp "${matches[0]}" dist/
+          done
+          ls -l dist
+
+      - name: Collect the unsigned macOS app and DMG
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle="target/$TARGET/release/bundle"
+          shopt -s nullglob
+          apps=("$bundle"/macos/*.app)
+          dmgs=("$bundle"/dmg/*.dmg)
+          if [ "${#apps[@]}" != 1 ] || [ "${#dmgs[@]}" != 1 ]; then
+            echo "::error::Expected one .app and one .dmg, found: ${apps[*]} ${dmgs[*]}"
+            exit 1
+          fi
+
+          # The names that dev-scripts/release/config.json expects:
+          #   sandboxapp_<version>_<arch>.unsigned.dmg
+          #   sandboxapp_<arch>.app.unsigned.tar        (no version)
+          # The signing script writes <dmg-base>.dmg and the updater archive
+          # <app-base>.app.tar.gz, and pairs the two inputs by the part after
+          # the last "_" (the architecture).
+          dmg_base="$(basename "${dmgs[0]}" .dmg)"
+          app_base="$(basename "${apps[0]}" .app)_${dmg_base##*_}"
+
+          # Packs the unsigned .app and the unsigned DMG. The signing script
+          # signs the app and rebuilds the DMG around it.
+          dev-scripts/release/ci/macos-collect.sh \
+            --app "${apps[0]}" --dmg "${dmgs[0]}" \
+            --app-base "$app_base" --dmg-base "$dmg_base" --out dist
+          ls -l dist
+
+      - name: Upload the bundles as a release artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-gui-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Install the Flatpak tools (stand-in for the build environment)
+        if: ${{ inputs.flatpak && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends flatpak ostree
+
+      # Builds the Flatpak repository with no signature and no static delta.
+      # The signing script signs the commits and the summary.
+      - name: Build the unsigned Flatpak repository
+        if: ${{ inputs.flatpak && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          version="$(jq -er .version src-tauri/tauri.conf.json)"
+          outdir=target/flatpak-repo
+          # Stand-in for flatpak-builder: a dummy app with the six refs of
+          # the sandbox repository.
+          sandbox/flatpak/build-dummy.sh "$version" "$RUNNER_TEMP/flatpak-src" "$outdir"
+          flatpak build-update-repo --default-branch=stable --prune "$outdir"
+
+          dev-scripts/release/ci/flatpak-collect.sh "$outdir" dist-flatpak
+          # flatpak-to-sign.tar has the origin input in config.json: the
+          # signer downloads it (artifact release-gui-flatpak).
+          # flatpak-repo.tar has the origin ci: the signer must not get it
+          # (artifact ci-gui-flatpak-repo).
+          mkdir dist-flatpak-repo
+          mv dist-flatpak/flatpak-repo.tar dist-flatpak-repo/
+          ls -l dist-flatpak dist-flatpak-repo
+
+      - name: Upload the Flatpak signing input as a release artifact
+        if: ${{ inputs.flatpak && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-gui-flatpak
+          path: dist-flatpak/
+          if-no-files-found: error
+
+      - name: Upload the unsigned Flatpak repository as a CI artifact
+        if: ${{ inputs.flatpak && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-gui-flatpak-repo
+          path: dist-flatpak-repo/
+          if-no-files-found: error
