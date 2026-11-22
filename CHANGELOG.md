@@ -5,6 +5,10 @@ of a version into its draft release.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-11-22
+
+- Release C: a signing run that was interrupted during the upload, then run again.
+
 ## [0.7.2] - 2026-11-22
 
 - Release B: a second release through the same pipeline.
