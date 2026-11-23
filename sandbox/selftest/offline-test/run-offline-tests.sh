@@ -1966,7 +1966,7 @@ if [ "$platform_ready" = 0 ]; then
 	fail "local steps" "the tools or fixtures of the real modules are missing (see above)"
 else
 # The name of the app in the fixture (the top directory of the archive).
-APP_DIR_NAME="$(tar -tf "$APPLE_IN/testapp_aarch64.app.unsigned.tar" | head -n 1 | cut -d/ -f1)"
+APP_DIR_NAME="$(tar -tf "$APPLE_IN/testapp_aarch64.app.unsigned.tar" | awk -F/ 'NR == 1 { print $1 }')"
 mkdir -p "$P/dev-scripts/release" "$P/keys" "$P/pages" "$P/src-tauri" "$P/brew" "$P/icons"
 cp "$SCRIPTS"/*.sh "$SCRIPTS"/*.py "$P/dev-scripts/release/"
 cp "$REPO"/keys/*.asc "$P/keys/"
@@ -2463,7 +2463,7 @@ if [ "$HOST_OS" = Darwin ]; then
 	# On macOS the real script runs its checks. The throwaway certificate is
 	# not an Apple certificate, so the requirement check must refuse it.
 	expect_err "verify-macos: on macOS the real verify-macos.sh runs up to the requirement check, which refuses the throwaway certificate" \
-		"codesign --verify --deep --strict with the requirement fails"
+		"error: $PDMG: codesign --verify with the requirement fails" "code failed to satisfy specified code requirement"
 else
 	expect_err "verify-macos: the real verify-macos.sh accepts the arguments and stops at its macOS check" "verify-macos.sh runs on macOS only"
 fi

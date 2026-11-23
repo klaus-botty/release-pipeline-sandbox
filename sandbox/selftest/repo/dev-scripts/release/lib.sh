@@ -597,8 +597,8 @@ write_updater_pubkey() {
 	filter="$(cfg .updater.pubkey_jq)"
 	[ -f "$file" ] || die "updater public key file not found: $file"
 	value="$(jq -er "$filter" "$file")" || die "no updater public key at $filter in $file"
-	is_base64 "$value" && printf '%s' "$value" | base64 --decode >"$1" ||
-		die "the updater public key in $file is not valid base64"
+	is_base64 "$value" || die "the updater public key in $file is not valid base64"
+	printf '%s' "$value" | base64 --decode >"$1" || die "the updater public key in $file is not valid base64"
 }
 
 # ---------------------------------------------------------------------------
