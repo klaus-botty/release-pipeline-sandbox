@@ -52,6 +52,13 @@ size_of() {
 	printf '%s\n' "$out"
 }
 
+# is_base64 TEXT: true if TEXT is standard base64 on one line, with padding.
+# The base64 of macOS decodes text with other characters without an error, so
+# a decode alone is no check.
+is_base64() {
+	[[ "$1" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ $((${#1} % 4)) = 0 ]
+}
+
 # name_in_list NAME LIST: true if the newline-separated LIST holds NAME as a
 # whole line. Pure shell, so it has no failure that a caller can miss.
 name_in_list() {
@@ -590,6 +597,7 @@ write_updater_pubkey() {
 	filter="$(cfg .updater.pubkey_jq)"
 	[ -f "$file" ] || die "updater public key file not found: $file"
 	value="$(jq -er "$filter" "$file")" || die "no updater public key at $filter in $file"
+	is_base64 "$value" || die "the updater public key in $file is not valid base64"
 	printf '%s' "$value" | base64 --decode >"$1" || die "the updater public key in $file is not valid base64"
 }
 
@@ -609,6 +617,70 @@ set_release_version() {
 	[[ "$version" =~ $SEMVER_RE ]] ||
 		die "tag $1 does not name a release version: '$version' is not a semantic version (expected v1.2.3 or 1.2.3)"
 	RELEASE_VERSION="$version"
+}
+
+# semver_cmp A B: prints -1, 0, or 1 when version A is lower than, equal to, or
+# higher than version B, by the precedence rules of Semantic Versioning 2.0.0
+# (build metadata does not count). Returns 2 unless both are semantic versions
+# without a leading "v". The same rules as the copy in the finalize workflow.
+semver_cmp() {
+	local LC_ALL=C a="$1" b="$2" ac bc ap="" bp="" i r x y
+	local -a an bn ai bi
+	[[ "$a" =~ $SEMVER_RE ]] && [[ "$b" =~ $SEMVER_RE ]] || return 2
+	a="${a%%+*}" b="${b%%+*}"
+	ac="${a%%-*}" bc="${b%%-*}"
+	[[ "$a" != *-* ]] || ap="${a#*-}"
+	[[ "$b" != *-* ]] || bp="${b#*-}"
+	IFS=. read -r -a an <<<"$ac"
+	IFS=. read -r -a bn <<<"$bc"
+	for i in 0 1 2; do
+		r="$(_semver_num_cmp "${an[$i]}" "${bn[$i]}")"
+		[ "$r" = 0 ] || { echo "$r"; return 0; }
+	done
+	# A version without a pre-release part ranks above one with it.
+	if [ -z "$ap" ] || [ -z "$bp" ]; then
+		if [ -z "$ap" ] && [ -z "$bp" ]; then echo 0; elif [ -z "$ap" ]; then echo 1; else echo -1; fi
+		return 0
+	fi
+	IFS=. read -r -a ai <<<"$ap"
+	IFS=. read -r -a bi <<<"$bp"
+	i=0
+	while :; do
+		if [ "$i" -ge "${#ai[@]}" ] && [ "$i" -ge "${#bi[@]}" ]; then echo 0; return 0; fi
+		[ "$i" -lt "${#ai[@]}" ] || { echo -1; return 0; }
+		[ "$i" -lt "${#bi[@]}" ] || { echo 1; return 0; }
+		x="${ai[$i]}" y="${bi[$i]}"
+		if [[ "$x" =~ ^[0-9]+$ ]] && [[ "$y" =~ ^[0-9]+$ ]]; then
+			r="$(_semver_num_cmp "$x" "$y")"
+		elif [[ "$x" =~ ^[0-9]+$ ]]; then
+			r=-1
+		elif [[ "$y" =~ ^[0-9]+$ ]]; then
+			r=1
+		elif [[ "$x" < "$y" ]]; then
+			r=-1
+		elif [[ "$x" > "$y" ]]; then
+			r=1
+		else
+			r=0
+		fi
+		[ "$r" = 0 ] || { echo "$r"; return 0; }
+		i=$((i + 1))
+	done
+}
+
+# _semver_num_cmp X Y: compares two numbers without leading zeros, of any
+# length.
+_semver_num_cmp() {
+	local LC_ALL=C
+	if [ "${#1}" -ne "${#2}" ]; then
+		if [ "${#1}" -lt "${#2}" ]; then echo -1; else echo 1; fi
+	elif [[ "$1" < "$2" ]]; then
+		echo -1
+	elif [[ "$1" > "$2" ]]; then
+		echo 1
+	else
+		echo 0
+	fi
 }
 
 # valid_repo_path PATH: a relative path inside the repository, without "..".
@@ -715,7 +787,7 @@ updater_sign() {
 # is never read from the file directly. Logs the cause and fails otherwise.
 updater_sig_comment() {
 	local pubkey="$1" sig="$2" file="$3" out rc=0
-	if ! base64 --decode <"$sig" >/dev/null 2>&1; then
+	if ! is_base64 "$(cat "$sig")" || ! base64 --decode <"$sig" >/dev/null 2>&1; then
 		log "${sig##*/} is not valid base64"
 		return 1
 	fi

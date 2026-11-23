@@ -12,7 +12,7 @@
 #
 # Public functions:
 #   apple_preflight tools
-#   apple_preflight secrets <notarize: true|false>
+#   apple_preflight secrets <notarize: true|false> <team_id>
 #   apple_process_arch <unsigned_app_tar> <unsigned_dmg> <entitlements_plist> <notarize> <out_dir>
 #   apple_process_all <in_dir> <entitlements_plist> <notarize> <out_dir>
 #   apple_tar_app <parent_dir> <app_name> <out_file> <gz|none>
@@ -111,9 +111,10 @@ _apple_host() {
 
 # apple_preflight tools: checks the tools for this host. Needs no secret, so
 # the caller can run it before the passphrase prompt.
-# apple_preflight secrets NOTARIZE: checks that the secret variables are set
-# and that rcodesign can open the certificate with the password. With
-# NOTARIZE=true, it also checks the App Store Connect API key.
+# apple_preflight secrets NOTARIZE TEAM_ID: checks that the secret variables
+# are set, that rcodesign can open the certificate with the password, and that
+# the certificate belongs to TEAM_ID (its subject.OU, the team that step 3
+# requires). With NOTARIZE=true, it also checks the App Store Connect API key.
 apple_preflight() {
 	local what="${1:-}" host out w
 	case "$what" in
@@ -139,6 +140,7 @@ apple_preflight() {
 		;;
 	secrets)
 		_apple_check_notarize_arg "${2:-}"
+		[[ "${3:-}" =~ ^[A-Z0-9]{10}$ ]] || die "apple_preflight secrets: the expected team ID is not 10 capital letters or digits: '${3:-}'"
 		[ -n "${APPLE_P12_BASE64:-}" ] || die "APPLE_P12_BASE64 is not set"
 		[ -n "${APPLE_P12_PASSWORD+set}" ] || die "APPLE_P12_PASSWORD is not set"
 		out="$(_apple_rcodesign analyze-certificate -C /dev/null --p12-file <(_apple_p12) \
@@ -147,13 +149,15 @@ apple_preflight() {
 		log "    Apple certificate: $(printf '%s\n' "$out" | sed -n 's/^Subject CN: *//p' | head -n 1)"
 		out="$(_apple_team_id)" || die "cannot read the team ID of the certificate in APPLE_P12_BASE64"
 		log "    Apple team ID (subject.OU of the certificate): $out"
+		[ "$out" = "$3" ] ||
+			die "the Apple certificate in the secrets belongs to team $out, but apple.team_id in config.json is $3. Step 3 accepts only signatures of team $3. Use the certificate of team $3 (just release-signing-setup)."
 		if [ "$2" = true ]; then
 			[ -n "${APPLE_API_KEY_JSON_BASE64:-}" ] || die "APPLE_API_KEY_JSON_BASE64 is not set (needed for notarization)"
 			_apple_api_key | jq -e '(.issuer_id | strings) and (.key_id | strings) and (.private_key | strings)' >/dev/null 2>&1 ||
 				die "APPLE_API_KEY_JSON_BASE64 is not the base64 of the JSON that 'rcodesign encode-app-store-connect-api-key' writes"
 		fi
 		;;
-	*) die "usage: apple_preflight tools | apple_preflight secrets <true|false>" ;;
+	*) die "usage: apple_preflight tools | apple_preflight secrets <true|false> <team_id>" ;;
 	esac
 }
 

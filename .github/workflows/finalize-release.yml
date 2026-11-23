@@ -40,7 +40,7 @@
 # - No input reaches a shell through an expression: inputs go through env.
 # - Each job checks the state first, so a re-run after a failure continues.
 #   A re-run of all jobs after publish-github re-verifies the published
-#   release instead of staging it.
+#   release: stage checks it as it is and uploads nothing.
 # - Each job writes one line to the job summary: what it did, the tag, and
 #   the manifest hash it used.
 name: Finalize release
@@ -129,58 +129,33 @@ jobs:
             echo "docker=$docker"
           } | tee -a "$GITHUB_OUTPUT"
 
-      - name: Verify and stage the draft release
+      # One call for both states. For a published release (a re-run after
+      # publish-github), stage runs the same checks, including the head check
+      # of GITHUB_SHA and the tag check, compares the published files with
+      # the signed manifest, and uploads nothing.
+      - name: Verify and stage the release
         id: stage
-        if: steps.state.outputs.published == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          PUBLISHED: ${{ steps.state.outputs.published }}
         run: |
           set -euo pipefail
+          if [ "$PUBLISHED" = true ]; then
+            echo "::notice title=Already published::Release $TAG is published already. This run verifies it and continues with the other channels."
+          fi
           repo/dev-scripts/release/finalize-release.sh stage --tag "$TAG" --run-id "$BUILD_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" --repo-root repo --out "$RUNNER_TEMP/verified"
-
-      # A re-run after publish-github: stage refuses a published release. A
-      # published release cannot change, so verify it as it is, and let the
-      # later jobs continue with it.
-      - name: Verify the published release
-        id: published
-        if: steps.state.outputs.published == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-          BUILD_RUN_ID: ${{ inputs.build_run_id }}
-        run: |
-          set -euo pipefail
-          # shellcheck source=/dev/null
-          . repo/dev-scripts/release/lib.sh
-          export REPO_ROOT="$PWD/repo"
-          load_config
-          branch="${CFG_RELEASE_BRANCH:-$(default_branch "$GITHUB_REPOSITORY")}"
-          [ "$GITHUB_REF" = "refs/heads/$branch" ] ||
-            die "this workflow runs on $GITHUB_REF. Start it from the branch $branch."
-          echo "::notice title=Already published::Release $TAG is published already. This run verifies it and continues with the other channels."
-          release="$(find_release "$GITHUB_REPOSITORY" "$TAG")"
-          commit="$(jq -r .target_commitish <<<"$release")"
-          valid_commit "$commit" || die "the release targets '$commit', not a full commit SHA"
-          [ "$(tag_commit "$GITHUB_REPOSITORY" "$TAG")" = "$commit" ] ||
-            die "git tag $TAG does not point to the release commit $commit"
-          require_build_run "$GITHUB_REPOSITORY" "$BUILD_RUN_ID" "$commit"
-          download_release_assets "$GITHUB_REPOSITORY" "$release" "$RUNNER_TEMP/verified"
-          repo/dev-scripts/release/verify-release.sh --dir "$RUNNER_TEMP/verified" --repo "$GITHUB_REPOSITORY" \
-            --tag "$TAG" --commit "$commit" --run-id "$BUILD_RUN_ID" --repo-root repo
-          echo "manifest_sha256=$(sha256_of "$RUNNER_TEMP/verified/$MANIFEST_NAME")" >>"$GITHUB_OUTPUT"
 
       - name: Record the verified manifest
         id: result
         env:
           TAG: ${{ inputs.tag }}
           STAGED: ${{ steps.stage.outputs.manifest_sha256 }}
-          PUBLISHED: ${{ steps.published.outputs.manifest_sha256 }}
         run: |
           set -euo pipefail
-          hash="${STAGED:-$PUBLISHED}"
+          hash="$STAGED"
           [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::No verified manifest hash."; exit 1; }
           # The set must pass the same check that every later job runs.
           repo/dev-scripts/release/finalize-release.sh check-set --dir "$RUNNER_TEMP/verified" \
@@ -416,6 +391,18 @@ jobs:
           add '*_x64.dmg' '' dmg-x86_64
           printf '%s' "$plan" >plan.txt
           cat plan.txt
+
+      # No upload of a version older than a published release, for example
+      # by a re-run of an old finalize run. (The real job runs this step only
+      # when the store does not serve the version yet; the sandbox has no
+      # store, so it always runs.)
+      - name: Refuse an older version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          repo/dev-scripts/release/finalize-release.sh require-newest --tag "$TAG" --repo "$GITHUB_REPOSITORY"
 
       - name: Stand-in for the upload
         env:

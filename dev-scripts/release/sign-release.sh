@@ -27,8 +27,10 @@
 # upload passed and before it starts step 3: a signed annotated tag on the
 # release commit, made with the release key and pushed with the git
 # credentials of your gh login. If that is not possible without a second
-# passphrase prompt or a large fetch, it makes a plain tag through the API.
-# An existing tag must point to the release commit.
+# passphrase prompt or a large fetch, or if the push still fails after two
+# more attempts (3 s and 6 s later), it makes a plain tag through the API. A
+# line "RESULT:" says which kind of tag GitHub holds in the end. An existing
+# tag must point to the release commit.
 #
 # Usage: sign-release.sh TAG [--repo OWNER/NAME] [--run-id ID] [--no-dispatch]
 #                            [--keep-workdir]
@@ -290,7 +292,9 @@ if [ "$needs_secrets" = 1 ]; then
 		APPLE_P12_BASE64="$(printf '%s' "$secrets" | jq -r .APPLE_P12_BASE64)"
 		APPLE_P12_PASSWORD="$(printf '%s' "$secrets" | jq -r .APPLE_P12_PASSWORD)"
 		APPLE_API_KEY_JSON_BASE64="$(printf '%s' "$secrets" | jq -r '.APPLE_API_KEY_JSON_BASE64 // ""')"
-		apple_preflight secrets "$CFG_APPLE_NOTARIZE"
+		# The team check of step 3, before any signature: a certificate of
+		# another team stops here, not after the signing and notarization.
+		apple_preflight secrets "$CFG_APPLE_NOTARIZE" "$CFG_APPLE_TEAM_ID"
 	fi
 	unset secrets
 fi
@@ -483,7 +487,8 @@ phase_done "self-check"
 # Upload: every file that the build did not make, or that differs from the
 # build output. CI adds the unchanged build output itself, after it verified
 # the signatures. Every upload goes to the release id, and GitHub's digest of
-# each upload must match.
+# each upload must match. The files upload in parallel; SHA256SUMS and
+# SHA256SUMS.asc go last, each alone.
 # ---------------------------------------------------------------------------
 step "Uploading to the draft release"
 final_names="$(list_dir "$assets")"
@@ -512,11 +517,12 @@ done <<<"$draft_state"
 	die "the draft release holds files that are not part of this release:$strays. Look at them, delete them by hand, then run this script again."
 
 uploaded=0 skipped=0
-# sync_asset NAME: makes the draft hold NAME with the bytes of this run. A file
-# that is on the draft with the same digest stays. A file with other bytes is
-# an earlier approval: this run replaces it. A build file that this run does
-# not upload is deleted, and the finalize workflow adds it from the build.
-sync_asset() {
+# prepare_asset NAME: makes the draft ready for NAME, and adds NAME to
+# to_upload if this run must upload it. A file that is on the draft with the
+# same digest stays. A file with other bytes is an earlier approval: this run
+# deletes it now and uploads its own. A build file that this run does not
+# upload is deleted, and the finalize workflow adds it from the build.
+prepare_asset() {
 	local name="$1" line id digest want
 	want="sha256:$(sha256_of "$assets/$name")" || die "cannot hash $name"
 	line="$(printf '%s\n' "$draft_state" | awk -v name="$name" '$1 == name')"
@@ -535,11 +541,52 @@ sync_asset() {
 			log "    $name is unchanged build output: the finalize workflow adds it again from build run $run_id."
 		fi
 	fi
-	name_in_list "$name" "$upload_names" || return 0
-	require_draft "$repo" "$release_id" "$tag" "$commit"
-	upload_release_asset "$repo" "$release_id" "$assets/$name" ||
-		die "upload of $name failed. The draft has no new $MANIFEST_NAME. Run this script again: it keeps the files that arrived."
-	uploaded=$((uploaded + 1))
+	if name_in_list "$name" "$upload_names"; then
+		to_upload+=("$name")
+	fi
+}
+
+# upload_assets NAME...: uploads the files, UPLOAD_JOBS at a time. Each upload
+# checks the draft first, and then the name, size, and digest that GitHub
+# reports (upload_release_asset). The log of each upload appears when it ends.
+# After the first failure, no new upload starts. The function waits for the
+# running uploads, then fails with the names of the files that did not arrive.
+UPLOAD_JOBS=4
+upload_assets() {
+	local logs="$work/upload-logs" name failed="" started=0 done_count=0
+	local -a pids names
+	pids=() names=()
+	mkdir -p "$logs"
+	# upload_reap: waits for the oldest running upload and shows its log.
+	upload_reap() {
+		local rc=0
+		wait "${pids[done_count]}" || rc=$?
+		sed 's/^/    /' "$logs/$done_count.log" >&2
+		if [ "$rc" = 0 ]; then
+			uploaded=$((uploaded + 1))
+			log "    uploaded: ${names[done_count]}"
+		else
+			failed="$failed ${names[done_count]}"
+		fi
+		done_count=$((done_count + 1))
+	}
+	for name in "$@"; do
+		[ -z "$failed" ] || break
+		[ $((started - done_count)) -lt "$UPLOAD_JOBS" ] || upload_reap
+		[ -z "$failed" ] || break
+		(
+			require_draft "$repo" "$release_id" "$tag" "$commit"
+			upload_release_asset "$repo" "$release_id" "$assets/$name"
+		) </dev/null >"$logs/$started.log" 2>&1 &
+		pids[started]=$!
+		names[started]="$name"
+		started=$((started + 1))
+	done
+	while [ "$done_count" -lt "$started" ]; do
+		upload_reap
+	done
+	[ -z "$failed" ] ||
+		die "upload of${failed} failed. The draft has no new $MANIFEST_NAME. Run this script again: it keeps the files that arrived."
 }
 
 # An earlier manifest goes first, so that the draft never holds an earlier
@@ -557,14 +604,20 @@ for name in "$MANIFEST_NAME" "$MANIFEST_SIG_NAME"; do
 	delete_release_asset "$repo" "$(printf '%s' "$line" | cut -d' ' -f2)" "$name"
 	draft_state="$(printf '%s\n' "$draft_state" | awk -v name="$name" '$1 != name')"
 done
+to_upload=()
 while IFS= read -r name; do
 	case "$name" in
 	"" | "$MANIFEST_NAME" | "$MANIFEST_SIG_NAME") continue ;;
 	esac
-	sync_asset "$name"
+	prepare_asset "$name"
 done <<<"$final_names"
-sync_asset "$MANIFEST_NAME"
-sync_asset "$MANIFEST_SIG_NAME"
+upload_assets ${to_upload[@]+"${to_upload[@]}"}
+# The manifest and its signature: each alone, after every other file arrived.
+for name in "$MANIFEST_NAME" "$MANIFEST_SIG_NAME"; do
+	to_upload=()
+	prepare_asset "$name"
+	upload_assets ${to_upload[@]+"${to_upload[@]}"}
+done
 
 # The draft must now hold every file of this run with the same digest, and
 # nothing else.
@@ -594,8 +647,16 @@ phase_done "upload"
 # files. Step 3 never creates a tag.
 # ---------------------------------------------------------------------------
 # tag_by_api REASON: a plain (lightweight, unsigned) tag through the API, with
-# the gh login of the maintainer.
+# the gh login of the maintainer. Does nothing if the tag exists already: a
+# push that reported a failure can still have landed, and another maintainer
+# can have made the tag. The check after this decides.
 tag_by_api() {
+	local existing
+	existing="$(tag_commit "$repo" "$tag")" || existing=""
+	if [ -n "$existing" ]; then
+		log "    $tag exists now (pointing to $existing), so no plain tag through the API ($1)."
+		return 0
+	fi
 	log "    FALLBACK: a plain tag through the API, because $1."
 	gh api -X POST "repos/$repo/git/refs" -f ref="refs/tags/$tag" -f sha="$commit" </dev/null >/dev/null ||
 		log "    the API refused to create the tag"
@@ -604,10 +665,20 @@ tag_by_api() {
 # signed_tag: makes a signed annotated tag object with the release key, and
 # pushes it to refs/tags/TAG. Writes only objects into the git object store of
 # this checkout: no ref, no branch, no work tree file changes. Returns 2 if a
-# step before the push fails (the caller falls back to the API), 1 if the push
-# fails.
+# step before the push fails (the caller falls back to the API), 1 if every
+# push attempt fails.
+#
+# GitHub can refuse a tag push for a short time: in the sandbox, 3 of 9 pushes
+# that reached the repository within 10 seconds of other pushes failed with a
+# bare "[remote rejected] ... (failed)", although the rule suite shows the
+# ruleset bypass for each of them. ("Bypassed rule violations ... creations
+# being restricted" is only the bypass notice; the good pushes show it too.)
+# So the push of the same object runs again after a short pause. A repeat is
+# harmless: the same object on the same ref is no change, and the push never
+# moves an existing tag.
+TAG_PUSH_PAUSES="3 6"
 signed_tag() {
-	local url="https://github.com/$repo.git" uid uid_re tagger started=$SECONDS t object
+	local url="https://github.com/$repo.git" uid uid_re tagger started=$SECONDS t object attempt pause existing
 	local -a git_gh
 	# The credentials of the gh login, for github.com only. No other helper.
 	git_gh=(git -C "$REPO_ROOT" -c credential.helper= -c "credential.https://github.com.helper=!gh auth git-credential")
@@ -645,13 +716,28 @@ signed_tag() {
 		tag_fallback_reason="git mktag refuses the tag object"
 		return 2
 	}
-	"${git_gh[@]}" push --quiet --no-verify "$url" "$object:refs/tags/$tag" </dev/null >&2 || return 1
-	log "    pushed the signed tag object $object (key $SIGNING_KEY, tagger $uid) in $((SECONDS - started)) s"
+	signed_tag_object="$object"
+	attempt=1
+	for pause in $TAG_PUSH_PAUSES end; do
+		if "${git_gh[@]}" push --quiet --no-verify "$url" "$object:refs/tags/$tag" </dev/null >&2; then
+			log "    pushed the signed tag object $object (key $SIGNING_KEY, tagger $uid) in $((SECONDS - started)) s, attempt $attempt"
+			return 0
+		fi
+		[ "$pause" != end ] || break
+		# Another push made the tag: a repeat cannot change it.
+		existing="$(tag_commit "$repo" "$tag")" || existing=""
+		[ -z "$existing" ] || break
+		log "    the push of the signed tag failed (attempt $attempt). Trying again in $pause s."
+		sleep "$pause"
+		attempt=$((attempt + 1))
+	done
+	tag_fallback_reason="git push of the signed tag failed $attempt times"
+	return 1
 }
 
 step "Making the git tag $tag on the release commit"
 manifest_sha256="$(sha256_of "$assets/$MANIFEST_NAME")" || die "cannot hash $MANIFEST_NAME"
-tag_fallback_reason=""
+tag_fallback_reason="" signed_tag_object=none
 case "$tag_plan" in
 exists) log "    $tag exists already and points to $commit" ;;
 api) tag_by_api "$tag_plan_reason" ;;
@@ -661,7 +747,7 @@ signed)
 	case "$rc" in
 	0) ;;
 	2) tag_by_api "$tag_fallback_reason" ;;
-	*) tag_by_api "git push of the signed tag failed" ;;
+	*) tag_by_api "$tag_fallback_reason" ;;
 	esac
 	;;
 esac
@@ -672,6 +758,15 @@ tag_now="$(tag_commit "$repo" "$tag")" || die "cannot read the git tag $tag"
 	die "cannot create the git tag $tag. The draft holds the signed files. Run this script again, or create the tag on $commit by hand (git push <remote> $commit:refs/tags/$tag), then start $CFG_FINALIZE_WORKFLOW."
 [ "$tag_now" = "$commit" ] ||
 	die "the git tag $tag points to $tag_now, not to the release commit $commit. $(release_retry_hint "$tag")"
+# Say which kind of tag GitHub holds now, whatever the way to it was.
+tag_ref="$(gh api "repos/$repo/git/matching-refs/tags/$tag" </dev/null |
+	jq -r --arg ref "refs/tags/$tag" '.[] | select(.ref == $ref) | "\(.object.type) \(.object.sha)"')" || tag_ref=""
+case "$tag_ref" in
+"tag $signed_tag_object") log "    RESULT: $tag is the signed tag object $signed_tag_object of the release key, on $commit." ;;
+"tag "*) log "    RESULT: $tag is an annotated tag object ${tag_ref#tag }, not made by this run, on $commit." ;;
+"commit "*) log "    RESULT: $tag is a plain tag without a signature, on $commit." ;;
+*) log "    RESULT: $tag points to $commit (cannot read its kind: '$tag_ref')." ;;
+esac
 phase_done "git tag"
 
 # ---------------------------------------------------------------------------

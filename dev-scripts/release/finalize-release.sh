@@ -10,6 +10,21 @@
 #       manifest_sha256=<sha256 of SHA256SUMS>. With --out, it also leaves the
 #       complete verified set in DIR (new or empty), for example to hand it to
 #       other jobs as a workflow artifact. Those jobs check it with check-set.
+#       A release that is published already (a re-run of the finalize
+#       workflow) gets the same checks, including the head check of
+#       GITHUB_SHA and the tag check, but no upload: it must hold every file
+#       of the signed manifest already, each with the digest of the manifest.
+#       So the workflow calls stage for both states.
+#   finalize-release.sh require-newest --tag TAG --repo OWNER/NAME
+#       Fails if a published release of REPO has a higher version than TAG,
+#       by the precedence rules of Semantic Versioning (TAG without one leading
+#       "v"). A job calls it right before it pushes TAG to a channel outside
+#       GitHub, so that no channel moves back to an older version. For a
+#       release version (no pre-release part), only published release versions
+#       count: a published pre-release such as 2.0.0-rc.1 does not block
+#       1.9.1. For a pre-release, every published version counts, so
+#       1.2.0-rc.2 is refused after 1.2.0. Tags that are not semantic versions
+#       and draft releases do not count.
 #   finalize-release.sh fetch --tag TAG --repo OWNER/NAME --manifest-sha256 HEX --dir DIR [NAME...]
 #       Downloads SHA256SUMS and the named release files (all files if no name
 #       is given) into DIR, and checks them against the pinned manifest.
@@ -50,7 +65,9 @@
 # Environment: GH_TOKEN (gh reads it; check-set and flatpak need none,
 # verify-macos uses it if set). GITHUB_SHA: stage
 # and publish refuse to run unless it is the head of the default branch, so
-# that they use the current scripts, signer keys, and allowlist. GITHUB_REF and
+# that they use the current scripts, signer keys, and allowlist. This holds
+# for a published release too: an old run must not hand an old release to the
+# later jobs. GITHUB_REF and
 # GITHUB_OUTPUT if set.
 
 set -euo pipefail
@@ -65,6 +82,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 usage() {
 	die "usage: finalize-release.sh stage --tag TAG --run-id ID --repo OWNER/NAME [--repo-root DIR] [--out DIR]
        finalize-release.sh fetch --tag TAG --repo OWNER/NAME --manifest-sha256 HEX --dir DIR [NAME...]
+       finalize-release.sh require-newest --tag TAG --repo OWNER/NAME
        finalize-release.sh publish --tag TAG --run-id ID --repo OWNER/NAME --manifest-sha256 HEX [--repo-root DIR]
        finalize-release.sh check-set --dir DIR --manifest-sha256 HEX [--subset] [--repo-root DIR]
        finalize-release.sh verify-macos --tag TAG --dir DIR [--manifest-sha256 HEX] [--unsigned-dir DIR] [--repo-root DIR]
@@ -78,6 +96,7 @@ shift
 case "$command" in
 stage) required="tag run-id repo" allowed="repo-root out" ;;
 fetch) required="tag repo manifest-sha256 dir" allowed="" ;;
+require-newest) required="tag repo" allowed="" ;;
 publish) required="tag run-id repo manifest-sha256" allowed="repo-root" ;;
 check-set) required="dir manifest-sha256" allowed="subset repo-root" ;;
 verify-macos) required="tag dir" allowed="manifest-sha256 unsigned-dir repo-root" ;;
@@ -150,7 +169,7 @@ verify-macos)
 	# token, or from raw.githubusercontent.com without one.
 	if [ -n "${GH_TOKEN:-}" ]; then need_tools gh gpg jq; else need_tools curl gpg jq; fi
 	;;
-fetch)
+fetch | require-newest)
 	[ -n "${GH_TOKEN:-}" ] || die "GH_TOKEN is not set"
 	need_tools gh jq
 	;;
@@ -171,11 +190,14 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# check_draft: the checks that stage and publish share. Sets release,
-# release_id, branch, and commit. With updater products, it also sets
-# RELEASE_VERSION and makes sure that the app configuration at the release
-# commit has this version and the updater public key of this checkout.
-check_draft() {
+# check_release STATES: the checks that stage and publish share. STATES is
+# "draft" (publish) or "draft published" (stage): the states of the release
+# that the caller accepts. Sets release, release_id, release_published (0 or
+# 1), branch, and commit. With updater products, it also sets RELEASE_VERSION
+# and makes sure that the app configuration at the release commit has this
+# version and the updater public key of this checkout.
+check_release() {
+	local states="$1" draft
 	# The allowlist and the signer keys come from the checkout of this run. Only
 	# the current head of the default branch decides who can sign.
 	require_current_trust_state "$repo"
@@ -188,12 +210,21 @@ check_draft() {
 	fi
 
 	release="$(find_release "$repo" "$tag")"
-	[ "$(printf '%s' "$release" | jq -r .draft)" = "true" ] ||
-		die "release $tag is not a draft. It is published already."
+	draft="$(printf '%s' "$release" | jq -r .draft)" || die "cannot read the draft state of release $tag"
+	case "$draft" in
+	true) release_published=0 ;;
+	false)
+		case " $states " in
+		*" published "*) release_published=1 ;;
+		*) die "release $tag is not a draft. It is published already." ;;
+		esac
+		;;
+	*) die "cannot read the draft state of release $tag: '$draft'" ;;
+	esac
 	release_id="$(printf '%s' "$release" | jq -r .id)"
 	[[ "$release_id" =~ ^[0-9]+$ ]] || die "the release has no valid id: $release_id"
 	commit="$(printf '%s' "$release" | jq -r .target_commitish)"
-	valid_commit "$commit" || die "the draft release targets '$commit'. The build workflow must set a full commit SHA."
+	valid_commit "$commit" || die "the release $tag targets '$commit'. The build workflow must set a full commit SHA."
 	require_build_run "$repo" "$run_id" "$commit" "$branch"
 	require_commit_on_branch "$repo" "$commit" "$branch"
 	require_tag_on_commit "$repo" "$tag" "$commit"
@@ -207,7 +238,7 @@ check_draft() {
 }
 
 stage() {
-	local staging="$work/staging" built="$work/built" manifest name present expected hash rerun upload_names="" now
+	local staging="$work/staging" built="$work/built" manifest name present expected hash rerun upload_names="" now what
 	load_config
 	load_allowed_signers
 	if [ -n "$out" ]; then
@@ -216,18 +247,28 @@ stage() {
 			[ -d "$out" ] && [ -z "$(ls -A "$out")" ] || die "$out exists and is not an empty directory"
 		fi
 	fi
-	check_draft
+	check_release "draft published"
 
-	rerun="The signing script has to run again."
-	[ "$(printf '%s' "$release" | jq -r '.assets | length')" != 0 ] ||
-		die "the draft release $tag has no files. The signing script has to run first."
-	step "Downloading the draft release"
+	if [ "$release_published" = 1 ]; then
+		# A published release cannot change. Check it as it is: the same
+		# checks as for a draft, but no file comes from the build run, and
+		# nothing is uploaded.
+		what="the published release $tag"
+		rerun="A published release cannot change, so a human must look at it. $(release_retry_hint "$tag")"
+		log "release $tag is published already: checking it as it is, without any upload"
+	else
+		what="the draft release"
+		rerun="The signing script has to run again."
+		[ "$(printf '%s' "$release" | jq -r '.assets | length')" != 0 ] ||
+			die "the draft release $tag has no files. The signing script has to run first."
+	fi
+	step "Downloading $what"
 	download_release_assets "$repo" "$release" "$staging"
 
 	step "Checking the signed manifest"
 	make_verify_keyring "$work/keyring"
 	manifest="$staging/$MANIFEST_NAME"
-	[ -f "$manifest" ] || die "the draft release has no $MANIFEST_NAME. $rerun"
+	[ -f "$manifest" ] || die "$what has no $MANIFEST_NAME. $rerun"
 	verify_detached "$staging/$MANIFEST_SIG_NAME" "$manifest" ||
 		die "$MANIFEST_NAME has no good signature from an allowed signer"
 	check_manifest "$manifest"
@@ -238,24 +279,31 @@ stage() {
 		case "$name" in
 		"" | "$MANIFEST_NAME" | "$MANIFEST_SIG_NAME") continue ;;
 		esac
-		name_in_list "$name" "$expected" || die "extra file on the draft release: $name"
+		name_in_list "$name" "$expected" || die "extra file on $what: $name. $rerun"
 		# Refuse a changed file before the large download of the build output.
 		hash="$(sha256_of "$staging/$name")" || die "cannot hash $name"
 		[ "$hash" = "$(manifest_hash "$manifest" "$name")" ] ||
-			die "hash mismatch for $name on the draft release: the file does not match $MANIFEST_NAME. $rerun"
+			die "hash mismatch for $name on $what: the file does not match $MANIFEST_NAME. $rerun"
 	done <<<"$present"
 
-	step "Adding the unchanged build files of run $run_id"
-	download_build_artifacts "$repo" "$run_id" "$built"
-	check_build_info "$built/$BUILD_INFO_NAME" "$repo" "$tag" "$commit" "$run_id" \
-		"The build output of run $run_id does not belong to release $tag."
-	while IFS= read -r name; do
-		[ -n "$name" ] || continue
-		[ ! -e "$staging/$name" ] || continue
-		[ -f "$built/$name" ] || die "$name is in $MANIFEST_NAME, but neither on the draft release nor in the build run. $rerun"
-		mv "$built/$name" "$staging/$name"
-		upload_names="$upload_names$name"$'\n'
-	done <<<"$expected"
+	if [ "$release_published" = 1 ]; then
+		while IFS= read -r name; do
+			[ -z "$name" ] || [ -e "$staging/$name" ] ||
+				die "$name is in $MANIFEST_NAME, but not on $what. $rerun"
+		done <<<"$expected"
+	else
+		step "Adding the unchanged build files of run $run_id"
+		download_build_artifacts "$repo" "$run_id" "$built"
+		check_build_info "$built/$BUILD_INFO_NAME" "$repo" "$tag" "$commit" "$run_id" \
+			"The build output of run $run_id does not belong to release $tag."
+		while IFS= read -r name; do
+			[ -n "$name" ] || continue
+			[ ! -e "$staging/$name" ] || continue
+			[ -f "$built/$name" ] || die "$name is in $MANIFEST_NAME, but neither on the draft release nor in the build run. $rerun"
+			mv "$built/$name" "$staging/$name"
+			upload_names="$upload_names$name"$'\n'
+		done <<<"$expected"
+	fi
 
 	step "Verifying the complete release"
 	"$SCRIPT_DIR/verify-release.sh" --dir "$staging" --repo "$repo" --tag "$tag" \
@@ -271,9 +319,9 @@ stage() {
 		done <<<"$upload_names"
 	fi
 
-	# The draft must now hold exactly the verified files.
+	# The release must now hold exactly the verified files.
 	now="$(release_assets "$repo" "$release_id")"
-	require_assets_match_dir "$now" "$staging" "the draft release $tag"
+	require_assets_match_dir "$now" "$staging" "$what"
 
 	if [ -n "$out" ]; then
 		mkdir -p "$out"
@@ -289,6 +337,32 @@ stage() {
 	if [ -n "${GITHUB_OUTPUT:-}" ]; then
 		printf 'manifest_sha256=%s\n' "$hash" >>"$GITHUB_OUTPUT"
 	fi
+}
+
+# require-newest: fails if a published release has a higher version than TAG.
+# The release of TAG itself can be a draft or published, and it does not need
+# to be visible: a token with read access sees no drafts.
+require_newest() {
+	local version list other_tag other draft order newer="" counted=0
+	set_release_version "$tag"
+	version="$RELEASE_VERSION"
+	list="$(gh api --paginate "repos/$repo/releases?per_page=100" </dev/null |
+		jq -r '.[] | "\(.tag_name) \(.draft)"')" || die "cannot list the releases of $repo"
+	while IFS=' ' read -r other_tag draft; do
+		[ -n "$other_tag" ] || continue
+		[ "$draft" = false ] || continue
+		other="${other_tag#v}"
+		[[ "$other" =~ $SEMVER_RE ]] || continue
+		# A release version competes only with release versions: a published
+		# pre-release never blocks a release version.
+		[[ "${version%%+*}" == *-* ]] || [[ "${other%%+*}" != *-* ]] || continue
+		counted=$((counted + 1))
+		order="$(semver_cmp "$other" "$version")" || die "cannot compare the versions $other and $version"
+		[ "$order" != 1 ] || newer="$newer $other_tag"
+	done <<<"$list"
+	[ -z "$newer" ] ||
+		die "release $tag (version $version) is not the newest published version of $repo. Newer published releases:$newer. Refusing to move a channel back to an older version."
+	log "release $tag (version $version) is the newest: no published release of $repo has a higher version ($counted compared)"
 }
 
 fetch() {
@@ -462,7 +536,7 @@ publish() {
 	local download="$work/release" hash before now after after_release problem published_commit
 	load_config
 	load_allowed_signers
-	check_draft
+	check_release draft
 
 	step "Verifying the draft release again"
 	# find_release read the full asset list. These are the assets that the
@@ -520,6 +594,7 @@ $(asset_state "$after" | sed 's/^/    /')"
 
 case "$command" in
 check-set) check_set ;;
+require-newest) require_newest ;;
 verify-macos) verify_macos ;;
 flatpak) flatpak_cmd ;;
 *) "$command" ;;
