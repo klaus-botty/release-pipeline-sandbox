@@ -899,7 +899,10 @@ case "$cmd" in
 api)
 	path="${args[0]}"
 	case "$method $path" in
-	"GET repos/"*"/releases?per_page=100") release_view | jq -c '[.]' | out ;;
+	"GET repos/"*"/releases?per_page=100")
+		# $S/other_releases: more releases (one JSON object per line) after
+		# the release of the test, for the version checks.
+		{ release_view; [ ! -s "$S/other_releases" ] || cat "$S/other_releases"; } | jq -c -s . | out ;;
 	"GET repos/"*/releases/assets/*)
 		id="${path##*/}"
 		name="$(asset_name "$id")"
@@ -1322,10 +1325,101 @@ gpg --batch --yes --local-user "$FPR_C" --armor --detach-sign --output "$GHS/ass
 stage
 expect_err "stage: manifest signed by an unknown key" "SHA256SUMS has no good signature"
 
-fake_state
-jq '.draft = false' "$GHS/release.json" >"$GHS/r" && mv "$GHS/r" "$GHS/release.json"
+# A published release (a re-run of the finalize workflow): stage checks it
+# as it is, with the same checks, and uploads nothing.
+published_state() {
+	fake_state
+	stage
+	[ "$RC" = 0 ] || fail "stage: published release: setup" "rc=$RC: $OUT"
+	jq '.draft = false' "$GHS/release.json" >"$GHS/r" && mv "$GHS/r" "$GHS/release.json"
+	: >"$GHS/calls.log"
+}
+published_state
+rm -rf "$T/pub-out"
+stage --out "$T/pub-out"
+if [ "$RC" = 0 ] && grep -qx "manifest_sha256=$GOOD_SHA" <<<"$OUT" && [ "$(uploads)" = 0 ] &&
+	grep -qF "release $TAG is published already: checking it as it is, without any upload" <<<"$OUT" &&
+	! grep -q "Adding the unchanged build files" <<<"$OUT" && [ -f "$T/pub-out/SHA256SUMS" ] &&
+	[ "$(jq -r .draft "$GHS/release.json")" = false ]; then
+	pass "stage: published release at the head: checked as it is, no upload, manifest hash printed"
+else
+	fail "stage: published release at the head" "rc=$RC uploads=$(uploads): $OUT"
+fi
+published_state
+FIN_SHA="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd" stage
+expect_err "stage: published release, run of an old commit" \
+	"this run uses the scripts, signer keys, and allowlist of commit cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd, but the head of the default branch main is $HEAD_SHA now"
+published_state
+git --git-dir="$REMOTE" update-ref -d "refs/tags/$TAG"
 stage
-expect_err "stage: published release" "is not a draft"
+expect_err "stage: published release without the tag" "git tag $TAG does not exist"
+published_state
+git --git-dir="$REMOTE" update-ref "refs/tags/$TAG" "$LATER_COMMIT"
+stage
+expect_err "stage: published release, tag on another commit" "git tag $TAG points to $LATER_COMMIT, not to the release commit"
+published_state
+printf 'changed\n' >>"$GHS/assets/sample_1.2.3_x64-setup.exe"
+stage
+expect_err "stage: published release with a changed asset" \
+	"hash mismatch for sample_1.2.3_x64-setup.exe on the published release $TAG: the file does not match SHA256SUMS" "A published release cannot change"
+[ "$(uploads)" = 0 ] && pass "stage: published release with a changed asset: no upload" || fail "stage: published release with a changed asset: no upload" "$(cat "$GHS/calls.log")"
+published_state
+jq '.assets |= map(select(.name != "tool_1.2.3_Linux_x86_64.tar"))' "$GHS/release.json" >"$GHS/r" && mv "$GHS/r" "$GHS/release.json"
+stage
+expect_err "stage: published release that lacks a file" "tool_1.2.3_Linux_x86_64.tar is in SHA256SUMS, but not on the published release $TAG"
+[ "$(uploads)" = 0 ] && pass "stage: published release that lacks a file: no upload" || fail "stage: published release that lacks a file: no upload" "$(cat "$GHS/calls.log")"
+published_state
+printf 'x\n' >"$T/stray.bin"
+put_asset "$T/stray.bin"
+stage
+expect_err "stage: published release with an extra file" "extra file on the published release $TAG: stray.bin"
+published_state
+publish
+expect_err "publish: published release" "is not a draft. It is published already."
+
+# require-newest: the guard before a push to a channel outside GitHub.
+newest() { fin require-newest --tag "${1:-$TAG}" --repo "$GH_REPO"; }
+other_release() { # TAG DRAFT
+	jq -n -c --arg t "$1" --argjson d "$2" '{id: 1, tag_name: $t, draft: $d, target_commitish: "x", html_url: "x", body: "", assets: []}' >>"$GHS/other_releases"
+}
+fake_state
+other_release v1.2.2 false
+other_release 1.3.0-rc.1 false
+other_release test-build false
+other_release v9.9.9 true
+newest
+if [ "$RC" = 0 ] && grep -qF "release $TAG (version 1.2.3) is the newest: no published release of $GH_REPO has a higher version (1 compared)" <<<"$OUT"; then
+	pass "require-newest: newest (a published pre-release, a non-version tag, and a draft do not count)"
+else
+	fail "require-newest: newest" "rc=$RC: $OUT"
+fi
+jq '.draft = false' "$GHS/release.json" >"$GHS/r" && mv "$GHS/r" "$GHS/release.json"
+newest
+expect_ok "require-newest: newest, published"
+other_release v1.10.0 false
+newest
+expect_err "require-newest: not newest" "release $TAG (version 1.2.3) is not the newest published version of $GH_REPO. Newer published releases: v1.10.0. Refusing to move a channel back"
+fake_state
+jq '.tag_name = "1.2.4-rc.2"' "$GHS/release.json" >"$GHS/r" && mv "$GHS/r" "$GHS/release.json"
+other_release v1.2.3 false
+other_release 1.2.4-rc.1 false
+other_release 1.2.4-beta.9 false
+newest 1.2.4-rc.2
+expect_ok "require-newest: pre-release above the published release and pre-releases"
+other_release 1.2.4-rc.10 false
+newest 1.2.4-rc.2
+expect_err "require-newest: pre-release below a newer pre-release" "Newer published releases: 1.2.4-rc.10."
+fake_state
+jq '.tag_name = "1.2.4-rc.2"' "$GHS/release.json" >"$GHS/r" && mv "$GHS/r" "$GHS/release.json"
+other_release 1.2.4 false
+newest 1.2.4-rc.2
+expect_err "require-newest: pre-release of a published release version" "Newer published releases: 1.2.4."
+fake_state
+other_release v1.2.4 false
+newest v1.2.5
+expect_ok "require-newest: the release of the tag need not be visible (a draft, read-only token)"
+newest not-a-version
+expect_err "require-newest: tag that is not a version" "is not a semantic version"
 
 fake_state
 jq '.head_sha = "fedcba9876543210fedcba9876543210fedcba98"' "$RUNDIR/run.json" >"$GHS/r" && mv "$GHS/r" "$RUNDIR/run.json"
@@ -1791,6 +1885,8 @@ else
 	grep -q "^tagger signer-a <signer-a@example.invalid> [0-9]* +0000$" <<<"$body" || problems="$problems tagger is not the identity of the key;"
 	grep -qx "SHA256SUMS: $(sha256 "$GHS/assets/SHA256SUMS" | cut -d' ' -f1)" <<<"$body" || problems="$problems the tag message does not name the signed manifest;"
 	grep -qF "pushed the signed tag object" <<<"$OUT" || problems="$problems no push line;"
+	grep -qF "RESULT: $TAG is the signed tag object $(remote_tag "$TAG") of the release key, on $COMMIT." <<<"$OUT" || problems="$problems no RESULT line for the signed tag;"
+	! grep -qF "Trying again" <<<"$OUT" || problems="$problems retried;"
 	! grep -qF "FALLBACK" <<<"$OUT" || problems="$problems fell back;"
 	grep -qE '\(git tag: [0-9]+ s\)' <<<"$OUT" || problems="$problems no time of the tag phase;"
 	[ "$(git -C "$REPO" symbolic-ref HEAD)" = "$branch_before" ] || problems="$problems the checked-out branch changed;"
@@ -1886,9 +1982,43 @@ empty_state
 printf '#!/bin/sh\necho "push denied" >&2\nexit 1\n' >"$REMOTE/hooks/pre-receive"
 chmod +x "$REMOTE/hooks/pre-receive"
 signr "$TAG" --no-dispatch
-[ "$RC" = 0 ] && grep -qF "FALLBACK: a plain tag through the API, because git push of the signed tag failed" <<<"$OUT" &&
-	[ "$(tag_type "$TAG")" = commit ] && pass "tag: fallback to a plain API tag when the push fails" ||
+[ "$RC" = 0 ] && grep -qF "FALLBACK: a plain tag through the API, because git push of the signed tag failed 3 times" <<<"$OUT" &&
+	grep -qF "the push of the signed tag failed (attempt 1). Trying again in 3 s." <<<"$OUT" &&
+	grep -qF "the push of the signed tag failed (attempt 2). Trying again in 6 s." <<<"$OUT" &&
+	[ "$(grep -c 'push denied' <<<"$OUT")" = 3 ] &&
+	grep -qF "RESULT: $TAG is a plain tag without a signature, on $COMMIT." <<<"$OUT" &&
+	[ "$(tag_type "$TAG")" = commit ] && pass "tag: three push attempts, then a plain API tag, and the RESULT line says so" ||
 	fail "tag: fallback when the push fails" "rc=$RC: $OUT"
+
+# A push that fails once, as in the sandbox (a bare "(failed)" during a burst
+# of pushes): the second attempt pushes the signed tag.
+empty_state
+rm -f "$T/push-failed-once"
+printf '#!/bin/sh\nif [ ! -e "%s" ]; then : >"%s"; echo "push failed for a moment" >&2; exit 1; fi\nexit 0\n' \
+	"$T/push-failed-once" "$T/push-failed-once" >"$REMOTE/hooks/pre-receive"
+chmod +x "$REMOTE/hooks/pre-receive"
+signr "$TAG" --no-dispatch
+[ "$RC" = 0 ] && grep -qF "the push of the signed tag failed (attempt 1). Trying again in 3 s." <<<"$OUT" &&
+	grep -qE "pushed the signed tag object [0-9a-f]{40} .* attempt 2$" <<<"$OUT" && ! grep -qF "FALLBACK" <<<"$OUT" &&
+	[ "$(tag_type "$TAG")" = tag ] && [ "$(tag_peeled "$TAG")" = "$COMMIT" ] &&
+	grep -qF "RESULT: $TAG is the signed tag object $(remote_tag "$TAG") of the release key" <<<"$OUT" &&
+	pass "tag: a push that fails once: the retry pushes the signed tag, no fallback" ||
+	fail "tag: retry after one failed push" "rc=$RC: $OUT"
+
+# The push fails, but the tag appears meanwhile (another maintainer made it):
+# no more attempts, no API call, and the RESULT line names the kind of tag.
+empty_state
+printf '#!/bin/sh\necho "push failed" >&2\nexit 1\n' >"$REMOTE/hooks/pre-receive"
+chmod +x "$REMOTE/hooks/pre-receive"
+# The first tag read is the preflight check; the second follows the push.
+printf '2 %s\n' "$COMMIT" >"$GHS/move_tag_on_read"
+signr "$TAG" --no-dispatch
+[ "$RC" = 0 ] && [ "$(grep -c 'push failed' <<<"$OUT")" = 1 ] && ! grep -qF "FALLBACK" <<<"$OUT" &&
+	grep -qF "$TAG exists now (pointing to $COMMIT), so no plain tag through the API" <<<"$OUT" &&
+	! grep -q "^api -X POST repos/$GH_REPO/git/refs" "$GHS/calls.log" &&
+	grep -qF "RESULT: $TAG is a plain tag without a signature, on $COMMIT." <<<"$OUT" &&
+	pass "tag: the tag appears after a failed push: no retry, no API tag" ||
+	fail "tag: the tag appears after a failed push" "rc=$RC: $OUT"
 
 empty_state
 printf '#!/bin/sh\nexit 1\n' >"$REMOTE/hooks/pre-receive"
