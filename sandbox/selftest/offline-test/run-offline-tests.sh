@@ -716,7 +716,7 @@ else
 	mkdir -p "$T/bm-good/check"
 	cp "$A"/*/* "$T/bm-good/out/release-build-info.json" "$T/bm-good/check/"
 	(cd "$T/bm-good/check" && sha256 -c "$T/bm-good/out/BUILD-SHA256SUMS") >/dev/null 2>&1 || problems="$problems hashes do not match;"
-	[ "$(wc -l <"$T/bm-good/out/BUILD-SHA256SUMS")" = 8 ] || problems="$problems manifest does not list 8 files (4 build, 2 input, 1 ci, info);"
+	[ "$(wc -l <"$T/bm-good/out/BUILD-SHA256SUMS" | tr -d ' ')" = 8 ] || problems="$problems manifest does not list 8 files (4 build, 2 input, 1 ci, info);"
 	grep -q " $CI_FILE\$" "$T/bm-good/out/BUILD-SHA256SUMS" || problems="$problems ci product not listed;"
 	[ -f "$A/release-linux/$AI" ] || problems="$problems the artifacts directory changed;"
 	if [ -z "$problems" ]; then pass "build manifest: good case (build, input, and ci products)"; else fail "build manifest: good case" "$problems"$'\n'"$OUT"; fi
@@ -1143,7 +1143,7 @@ uploads() { grep -c '^api -X POST .*https://uploads.github.com/' "$GHS/calls.log
 fake_state
 GITHUB_OUTPUT="$T/gh-output" stage
 if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -qx "manifest_sha256=$GOOD_SHA" && grep -qx "manifest_sha256=$GOOD_SHA" "$T/gh-output" &&
-	[ "$(ls "$GHS/assets" | wc -l)" = "$(ls "$GOOD" | wc -l)" ] && diff -r "$GOOD" "$GHS/assets" >/dev/null &&
+	[ "$(ls "$GHS/assets" | wc -l | tr -d ' ')" = "$(ls "$GOOD" | wc -l | tr -d ' ')" ] && diff -r "$GOOD" "$GHS/assets" >/dev/null &&
 	[ "$(uploads)" = 5 ]; then
 	pass "stage: good case uploads the build files and prints the manifest hash"
 else
@@ -1204,7 +1204,7 @@ expect_err "check-set: refuses options of other commands" "check-set does not ta
 D="$T/fetch1"
 fin fetch --tag "$TAG" --repo "$GH_REPO" --manifest-sha256 "$GOOD_SHA" --dir "$D"
 if [ "$RC" = 0 ] && diff -r -x SHA256SUMS.asc "$GHS/assets" "$D" >/dev/null 2>&1 &&
-	[ "$(ls "$D" | wc -l)" = "$(($(wc -l <"$GOOD/SHA256SUMS") + 1))" ] && [ ! -e "$D/SHA256SUMS.asc" ]; then
+	[ "$(ls "$D" | wc -l | tr -d ' ')" = "$(($(wc -l <"$GOOD/SHA256SUMS") + 1))" ] && [ ! -e "$D/SHA256SUMS.asc" ]; then
 	# SHA256SUMS plus every listed file: SHA256SUMS.asc is the only file not fetched
 	pass "fetch: all files"
 else
@@ -2152,7 +2152,7 @@ else
 	cmp -s "$T/pfsig/refs.txt" "$T/pfin/refs.txt" || problems="$problems the approved refs.txt differs;"
 	[ "$(gpg --batch --status-fd 1 --verify "$T/pfsig/summary.sig" "$T/pfin/summary" 2>/dev/null | awk '$2 == "VALIDSIG" { print $NF }')" = "$FPR_A" ] ||
 		problems="$problems summary.sig is not a signature by $FPR_A;"
-	[ "$(find "$T/pfsig/objects" -name '*.commit.sig' | wc -l)" = 6 ] || problems="$problems not 6 commit signatures;"
+	[ "$(find "$T/pfsig/objects" -name '*.commit.sig' | wc -l | tr -d ' ')" = 6 ] || problems="$problems not 6 commit signatures;"
 	if [ -z "$problems" ]; then pass "local steps: Apple, Flatpak, and Homebrew products, signed and uploaded, in order, with phase times"; else fail "local steps: good case" "$problems"$'\n'"$OUT"; fi
 	printf '      phases: %s\n' "$(grep -oE '\((preflight|unlock|download|provenance check|Apple|Flatpak|Homebrew|updater signatures|PGP signatures|self-check|upload|git tag): [0-9]+ s\)' <<<"$OUT" | tr '\n' ' ')"
 fi
@@ -2458,7 +2458,14 @@ expect_err "verify-macos: without GH_TOKEN, a missing file fails" "cannot read s
 mkdir -p "$GHS/contents/$COMMIT/src-tauri"
 cp "$P/src-tauri/Entitlements.plist" "$GHS/contents/$COMMIT/src-tauri/"
 pfin verify-macos --tag "$TAG" --dir "$T/p-staged" --repo-root "$P"
-expect_err "verify-macos: the real verify-macos.sh accepts the arguments and stops at its macOS check" "verify-macos.sh runs on macOS only"
+if [ "$HOST_OS" = Darwin ]; then
+	# On macOS the real script runs its checks. The throwaway certificate is
+	# not an Apple certificate, so the requirement check must refuse it.
+	expect_err "verify-macos: on macOS the real verify-macos.sh runs up to the requirement check, which refuses the throwaway certificate" \
+		"codesign --verify --deep --strict with the requirement fails"
+else
+	expect_err "verify-macos: the real verify-macos.sh accepts the arguments and stops at its macOS check" "verify-macos.sh runs on macOS only"
+fi
 
 # finalize-release.sh flatpak.
 vmfin flatpak --tag "$TAG" --dir "$T/p-staged" --manifest-sha256 "$PSHA" --repo-tar "$FP_CI/flatpak-repo.tar" --out "$T/fp-out" --repo-root "$P"
