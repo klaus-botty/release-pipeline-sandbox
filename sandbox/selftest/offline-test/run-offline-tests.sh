@@ -1440,7 +1440,8 @@ expect_err "sign: missing local products stop the script before signing" \
 LOCAL_STEPS='v="$RELEASE_VERSION"
 { cat "$inputs/sample_${v}_aarch64.unsigned.dmg"; printf "signed\\n"; } >"$assets/sample_${v}_aarch64.dmg"
 { cat "$inputs/sample_aarch64.app.unsigned.tar"; printf "signed\\n"; } >"$assets/sample_aarch64.app.tar.gz"'
-awk -v steps="$LOCAL_STEPS" '$0 == "# (end of the local steps)" { print steps } { print }' \
+# The text goes through the environment: BSD awk refuses a newline in -v.
+steps="$LOCAL_STEPS" awk '$0 == "# (end of the local steps)" { print ENVIRON["steps"] } { print }' \
 	"$REPO/dev-scripts/release/sign-release.sh" >"$T/sign.tmp"
 if grep -q 'sample_aarch64.app.tar.gz' "$T/sign.tmp"; then
 	cat "$T/sign.tmp" >"$REPO/dev-scripts/release/sign-release.sh"

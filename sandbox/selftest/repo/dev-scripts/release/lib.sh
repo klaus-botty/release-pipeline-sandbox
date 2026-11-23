@@ -52,6 +52,13 @@ size_of() {
 	printf '%s\n' "$out"
 }
 
+# is_base64 TEXT: true if TEXT is standard base64 on one line, with padding.
+# The base64 of macOS decodes text with other characters without an error, so
+# a decode alone is no check.
+is_base64() {
+	[[ "$1" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ $((${#1} % 4)) = 0 ]
+}
+
 # name_in_list NAME LIST: true if the newline-separated LIST holds NAME as a
 # whole line. Pure shell, so it has no failure that a caller can miss.
 name_in_list() {
@@ -590,7 +597,8 @@ write_updater_pubkey() {
 	filter="$(cfg .updater.pubkey_jq)"
 	[ -f "$file" ] || die "updater public key file not found: $file"
 	value="$(jq -er "$filter" "$file")" || die "no updater public key at $filter in $file"
-	printf '%s' "$value" | base64 --decode >"$1" || die "the updater public key in $file is not valid base64"
+	is_base64 "$value" && printf '%s' "$value" | base64 --decode >"$1" ||
+		die "the updater public key in $file is not valid base64"
 }
 
 # ---------------------------------------------------------------------------
@@ -715,7 +723,7 @@ updater_sign() {
 # is never read from the file directly. Logs the cause and fails otherwise.
 updater_sig_comment() {
 	local pubkey="$1" sig="$2" file="$3" out rc=0
-	if ! base64 --decode <"$sig" >/dev/null 2>&1; then
+	if ! is_base64 "$(cat "$sig")" || ! base64 --decode <"$sig" >/dev/null 2>&1; then
 		log "${sig##*/} is not valid base64"
 		return 1
 	fi
