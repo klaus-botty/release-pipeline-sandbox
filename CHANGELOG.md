@@ -5,6 +5,10 @@ of a version into its draft release.
 
 ## [Unreleased]
 
+## [10.0.0] - test
+
+- Final proof release of the pipeline.
+
 ## [0.8.10] - test
 
 - Negative test release 0.8.10.
