@@ -1,0 +1,26 @@
+cask "sampleapp" do
+  version "VERSION_PLACEHOLDER"
+
+  on_arm do
+    sha256 "AARCH64_SHA256_PLACEHOLDER"
+    url "https://github.com/example-owner/example-repo/releases/download/TAG_PLACEHOLDER/sampleapp_#{version}_aarch64.dmg"
+  end
+
+  on_intel do
+    sha256 "X64_SHA256_PLACEHOLDER"
+    url "https://github.com/example-owner/example-repo/releases/download/TAG_PLACEHOLDER/sampleapp_#{version}_x64.dmg"
+  end
+
+  name "Sampleapp"
+  desc "Sample application"
+  homepage "https://github.com/example-owner/example-repo"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  auto_updates true
+
+  app "sampleapp.app"
+end

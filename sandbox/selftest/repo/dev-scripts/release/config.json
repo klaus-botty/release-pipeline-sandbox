@@ -1,0 +1,88 @@
+{
+  "repository": "example-owner/example-repo",
+  "build_workflow": "build-release.yml",
+  "build_event": "workflow_dispatch",
+  "finalize_workflow": "finalize-release.yml",
+  "artifact_pattern": "release-*",
+  "ci_artifact_pattern": "ci-*",
+  "signer_keys_dir": "utils/gpg_keys",
+  "allowed_signers": "dev-scripts/release/allowed-signers.txt",
+  "updater": {
+    "pubkey_file": "src-tauri/tauri.conf.json",
+    "pubkey_jq": ".plugins.updater.pubkey",
+    "version_file": "src-tauri/tauri.conf.json",
+    "version_jq": ".version"
+  },
+  "apple": {
+    "entitlements_file": "src-tauri/Entitlements.plist",
+    "notarize": true,
+    "requirement": "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"ZZTEST0002\"",
+    "team_id": "ZZTEST0002",
+    "bundle_id": "org.example.sampleapp"
+  },
+  "flatpak": {
+    "app_id": "org.example.SampleApp",
+    "arch": "x86_64",
+    "branch": "stable",
+    "extra_refs": [],
+    "fingerprint": "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555",
+    "bundle_name": "org.example.SampleApp.flatpak",
+    "pages": [
+      "flatpak/index.html",
+      "flatpak/sampleapp.flatpakrepo",
+      "flatpak/org.example.SampleApp.flatpakref",
+      "src-tauri/icons/icon.png",
+      "README.md"
+    ],
+    "url": "https://example-owner.github.io/example-repo",
+    "homepage": "https://github.com/example-owner/example-repo",
+    "to_sign": "flatpak-to-sign.tar",
+    "repo_tar": "flatpak-repo.tar",
+    "signatures": "flatpak-signatures.tar"
+  },
+  "homebrew": {
+    "generator": "dev-scripts/homebrew/generate-formula.sh",
+    "output": "sampleapp.rb",
+    "dmg": {
+      "aarch64": "sampleapp_{version}_aarch64.dmg",
+      "x64": "sampleapp_{version}_x64.dmg"
+    }
+  },
+  "products": [
+    {"name": "cli_{version}_Linux_x86_64.tar", "origin": "build"},
+    {"name": "cli_{version}_Darwin_aarch64.tar", "origin": "build"},
+    {"name": "cli_{version}_Darwin_x86_64.tar", "origin": "build"},
+    {"name": "cli_{version}_Windows_x86_64.zip", "origin": "build"},
+    {"name": "asb_{version}_Linux_x86_64.tar", "origin": "build"},
+    {"name": "asb_{version}_Darwin_aarch64.tar", "origin": "build"},
+    {"name": "asb_{version}_Darwin_x86_64.tar", "origin": "build"},
+    {"name": "asb_{version}_Windows_x86_64.zip", "origin": "build"},
+    {"name": "asb-controller_{version}_Linux_x86_64.tar", "origin": "build"},
+    {"name": "asb-controller_{version}_Darwin_aarch64.tar", "origin": "build"},
+    {"name": "asb-controller_{version}_Darwin_x86_64.tar", "origin": "build"},
+    {"name": "asb-controller_{version}_Windows_x86_64.zip", "origin": "build"},
+    {"name": "rendezvous-node_{version}_Linux_x86_64.tar", "origin": "build"},
+    {"name": "rendezvous-node_{version}_Darwin_aarch64.tar", "origin": "build"},
+    {"name": "rendezvous-node_{version}_Darwin_x86_64.tar", "origin": "build"},
+    {"name": "rendezvous-node_{version}_Windows_x86_64.zip", "origin": "build"},
+    {"name": "orchestrator_{version}_Linux_x86_64.tar", "origin": "build"},
+    {"name": "orchestrator_{version}_Darwin_aarch64.tar", "origin": "build"},
+    {"name": "orchestrator_{version}_Darwin_x86_64.tar", "origin": "build"},
+    {"name": "orchestrator_{version}_Windows_x86_64.zip", "origin": "build"},
+    {"name": "sampleapp_{version}_amd64.AppImage", "origin": "build", "updater": ["linux-x86_64", "linux-x86_64-appimage"]},
+    {"name": "sampleapp_{version}_amd64.deb", "origin": "build", "updater": ["linux-x86_64-deb"]},
+    {"name": "sampleapp_{version}_x64-setup.exe", "origin": "build", "updater": ["windows-x86_64", "windows-x86_64-nsis"]},
+    {"name": "sampleapp_aarch64.app.unsigned.tar", "origin": "input"},
+    {"name": "sampleapp_x64.app.unsigned.tar", "origin": "input"},
+    {"name": "sampleapp_{version}_aarch64.unsigned.dmg", "origin": "input"},
+    {"name": "sampleapp_{version}_x64.unsigned.dmg", "origin": "input"},
+    {"name": "flatpak-to-sign.tar", "origin": "input"},
+    {"name": "flatpak-repo.tar", "origin": "ci"},
+    {"name": "sampleapp_aarch64.app.tar.gz", "origin": "local", "updater": ["darwin-aarch64", "darwin-aarch64-app"]},
+    {"name": "sampleapp_x64.app.tar.gz", "origin": "local", "updater": ["darwin-x86_64", "darwin-x86_64-app"]},
+    {"name": "sampleapp_{version}_aarch64.dmg", "origin": "local"},
+    {"name": "sampleapp_{version}_x64.dmg", "origin": "local"},
+    {"name": "flatpak-signatures.tar", "origin": "local"},
+    {"name": "sampleapp.rb", "origin": "local"}
+  ]
+}

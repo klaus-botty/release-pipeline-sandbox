@@ -1,0 +1,57 @@
+name: Selftest macOS
+
+# The offline tests of the release scripts on real macOS: /bin/bash (3.2) and
+# the BSD tools of macOS, against the neutral copy in sandbox/selftest/.
+# Nothing secret: every key is a throwaway key or fixture.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RCS_URL: https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
+  RCS_SHA256: d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d
+
+jobs:
+  selftest:
+    name: Offline tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install gnupg and minisign (Homebrew)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install gnupg minisign
+      - name: Install rcodesign 0.29.0 (pinned SHA-256)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/rcodesign.tar.gz" "$RCS_URL"
+          echo "$RCS_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | shasum -a 256 -c -
+          mkdir "$RUNNER_TEMP/rcodesign"
+          tar -xzf "$RUNNER_TEMP/rcodesign.tar.gz" -C "$RUNNER_TEMP/rcodesign" --strip-components 1
+          echo "$RUNNER_TEMP/rcodesign" >>"$GITHUB_PATH"
+      - name: Run the offline tests with /bin/bash and the BSD tools
+        run: |
+          set -o pipefail
+          /bin/bash sandbox/selftest/run-macos.sh "$RUNNER_TEMP/selftest" 2>&1 | tee "$RUNNER_TEMP/selftest.log"
+      - name: Summary
+        if: always()
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          {
+            echo "### $RUNNER_LABEL"
+            echo '```'
+            grep -E '^(FAIL|SKIP)  |^passed: ' "$RUNNER_TEMP/selftest.log" || echo "no test result"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
